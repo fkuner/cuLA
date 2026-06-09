@@ -48,6 +48,43 @@ TILE_K_MTP = 128
 NUM_THREADS_MTP = 128  # 4 warps
 
 
+# ============================================================================
+# FMA pair helpers (packed F32x2 on SM100; scalar fallback on SM90)
+# ============================================================================
+@cute.jit
+def la_update_pair(h_lo, h_hi, k_lo, k_hi, v_j, decay, use_packed_fma: cutlass.Constexpr[bool]):
+    """Inner LA recurrence on a (lo, hi) pair: h = h*decay + k*v_j."""
+    if cutlass.const_expr(use_packed_fma):
+        # h *= decay   (packed mul implemented as FMA with src_c=0)
+        h_lo, h_hi = cute.arch.fma_packed_f32x2(
+            src_a=(h_lo, h_hi),
+            src_b=(decay, decay),
+            src_c=(cutlass.Float32(0.0), cutlass.Float32(0.0)),
+        )
+        # h += k * v_j
+        h_lo, h_hi = cute.arch.fma_packed_f32x2(
+            src_a=(k_lo, k_hi),
+            src_b=(v_j, v_j),
+            src_c=(h_lo, h_hi),
+        )
+        return h_lo, h_hi
+    else:
+        return h_lo * decay + k_lo * v_j, h_hi * decay + k_hi * v_j
+
+
+@cute.jit
+def hq_dot_pair(h_lo, h_hi, q_lo, q_hi, sum_lo, sum_hi, use_packed_fma: cutlass.Constexpr[bool]):
+    """Accumulate dot product over a (lo, hi) pair: sum += h * q."""
+    if cutlass.const_expr(use_packed_fma):
+        return cute.arch.fma_packed_f32x2(
+            src_a=(h_lo, h_hi),
+            src_b=(q_lo, q_hi),
+            src_c=(sum_lo, sum_hi),
+        )
+    else:
+        return h_lo * q_lo + sum_lo, h_hi * q_hi + sum_hi
+
+
 # TODO: re-tune for LA after first benchmark.
 def get_mtp_config(B: int, T: int, HV: int, V: int, disable_state_update: bool) -> tuple:
     """Pick (tile_v, vec_size, ilp_rows, use_smem_v) based on work units.
@@ -220,9 +257,17 @@ def la_verify_kernel_mtp(
                             r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
                             r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
 
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] = r_h[0, i] * r_decay + r_k[i] * r_v_a
-                            r_h[1, i] = r_h[1, i] * r_decay + r_k[i] * r_v_b
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            r_h[0, i], r_h[0, i + 1] = la_update_pair(
+                                r_h[0, i], r_h[0, i + 1],
+                                r_k[i], r_k[i + 1],
+                                r_v_a, r_decay, use_packed_fma,
+                            )
+                            r_h[1, i], r_h[1, i + 1] = la_update_pair(
+                                r_h[1, i], r_h[1, i + 1],
+                                r_k[i], r_k[i + 1],
+                                r_v_b, r_decay, use_packed_fma,
+                            )
 
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
@@ -237,11 +282,23 @@ def la_verify_kernel_mtp(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
-                        sum_hq_a = cutlass.Float32(0.0)
-                        sum_hq_b = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_a += r_h[0, i] * r_q[i]
-                            sum_hq_b += r_h[1, i] * r_q[i]
+                        sum_hq_a_lo = cutlass.Float32(0.0)
+                        sum_hq_a_hi = cutlass.Float32(0.0)
+                        sum_hq_b_lo = cutlass.Float32(0.0)
+                        sum_hq_b_hi = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            sum_hq_a_lo, sum_hq_a_hi = hq_dot_pair(
+                                r_h[0, i], r_h[0, i + 1],
+                                r_q[i], r_q[i + 1],
+                                sum_hq_a_lo, sum_hq_a_hi, use_packed_fma,
+                            )
+                            sum_hq_b_lo, sum_hq_b_hi = hq_dot_pair(
+                                r_h[1, i], r_h[1, i + 1],
+                                r_q[i], r_q[i + 1],
+                                sum_hq_b_lo, sum_hq_b_hi, use_packed_fma,
+                            )
+                        sum_hq_a = sum_hq_a_lo + sum_hq_a_hi
+                        sum_hq_b = sum_hq_b_lo + sum_hq_b_hi
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hq_a += cute.arch.shuffle_sync_bfly(
                                 sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
@@ -337,11 +394,27 @@ def la_verify_kernel_mtp(
 
                         # ---- (2c) fused decay + rank-1 update ----
                         # r_h[j,i] = r_h[j,i] * r_decay + r_k[i] * r_v[j]
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] = r_h[0, i] * r_decay + r_k[i] * r_v_a
-                            r_h[1, i] = r_h[1, i] * r_decay + r_k[i] * r_v_b
-                            r_h[2, i] = r_h[2, i] * r_decay + r_k[i] * r_v_c
-                            r_h[3, i] = r_h[3, i] * r_decay + r_k[i] * r_v_d
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            r_h[0, i], r_h[0, i + 1] = la_update_pair(
+                                r_h[0, i], r_h[0, i + 1],
+                                r_k[i], r_k[i + 1],
+                                r_v_a, r_decay, use_packed_fma,
+                            )
+                            r_h[1, i], r_h[1, i + 1] = la_update_pair(
+                                r_h[1, i], r_h[1, i + 1],
+                                r_k[i], r_k[i + 1],
+                                r_v_b, r_decay, use_packed_fma,
+                            )
+                            r_h[2, i], r_h[2, i + 1] = la_update_pair(
+                                r_h[2, i], r_h[2, i + 1],
+                                r_k[i], r_k[i + 1],
+                                r_v_c, r_decay, use_packed_fma,
+                            )
+                            r_h[3, i], r_h[3, i + 1] = la_update_pair(
+                                r_h[3, i], r_h[3, i + 1],
+                                r_k[i], r_k[i + 1],
+                                r_v_d, r_decay, use_packed_fma,
+                            )
 
                         # ---- (2d) optional intermediate-state cache ----
                         if cutlass.const_expr(cache_intermediate_states):
@@ -368,15 +441,39 @@ def la_verify_kernel_mtp(
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # ---- (2e) o_t = h_t @ q_t (per-row warp reduce) ----
-                        sum_hq_a = cutlass.Float32(0.0)
-                        sum_hq_b = cutlass.Float32(0.0)
-                        sum_hq_c = cutlass.Float32(0.0)
-                        sum_hq_d = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_a += r_h[0, i] * r_q[i]
-                            sum_hq_b += r_h[1, i] * r_q[i]
-                            sum_hq_c += r_h[2, i] * r_q[i]
-                            sum_hq_d += r_h[3, i] * r_q[i]
+                        sum_hq_a_lo = cutlass.Float32(0.0)
+                        sum_hq_a_hi = cutlass.Float32(0.0)
+                        sum_hq_b_lo = cutlass.Float32(0.0)
+                        sum_hq_b_hi = cutlass.Float32(0.0)
+                        sum_hq_c_lo = cutlass.Float32(0.0)
+                        sum_hq_c_hi = cutlass.Float32(0.0)
+                        sum_hq_d_lo = cutlass.Float32(0.0)
+                        sum_hq_d_hi = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            sum_hq_a_lo, sum_hq_a_hi = hq_dot_pair(
+                                r_h[0, i], r_h[0, i + 1],
+                                r_q[i], r_q[i + 1],
+                                sum_hq_a_lo, sum_hq_a_hi, use_packed_fma,
+                            )
+                            sum_hq_b_lo, sum_hq_b_hi = hq_dot_pair(
+                                r_h[1, i], r_h[1, i + 1],
+                                r_q[i], r_q[i + 1],
+                                sum_hq_b_lo, sum_hq_b_hi, use_packed_fma,
+                            )
+                            sum_hq_c_lo, sum_hq_c_hi = hq_dot_pair(
+                                r_h[2, i], r_h[2, i + 1],
+                                r_q[i], r_q[i + 1],
+                                sum_hq_c_lo, sum_hq_c_hi, use_packed_fma,
+                            )
+                            sum_hq_d_lo, sum_hq_d_hi = hq_dot_pair(
+                                r_h[3, i], r_h[3, i + 1],
+                                r_q[i], r_q[i + 1],
+                                sum_hq_d_lo, sum_hq_d_hi, use_packed_fma,
+                            )
+                        sum_hq_a = sum_hq_a_lo + sum_hq_a_hi
+                        sum_hq_b = sum_hq_b_lo + sum_hq_b_hi
+                        sum_hq_c = sum_hq_c_lo + sum_hq_c_hi
+                        sum_hq_d = sum_hq_d_lo + sum_hq_d_hi
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hq_a += cute.arch.shuffle_sync_bfly(
                                 sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
@@ -488,15 +585,39 @@ def la_verify_kernel_mtp(
                             r_v_6 = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_6])
                             r_v_7 = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_7])
 
-                        for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] = r_h[0, i] * r_decay + r_k[i] * r_v_0
-                            r_h[1, i] = r_h[1, i] * r_decay + r_k[i] * r_v_1
-                            r_h[2, i] = r_h[2, i] * r_decay + r_k[i] * r_v_2
-                            r_h[3, i] = r_h[3, i] * r_decay + r_k[i] * r_v_3
-                            r_h[4, i] = r_h[4, i] * r_decay + r_k[i] * r_v_4
-                            r_h[5, i] = r_h[5, i] * r_decay + r_k[i] * r_v_5
-                            r_h[6, i] = r_h[6, i] * r_decay + r_k[i] * r_v_6
-                            r_h[7, i] = r_h[7, i] * r_decay + r_k[i] * r_v_7
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            r_h[0, i], r_h[0, i + 1] = la_update_pair(
+                                r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1],
+                                r_v_0, r_decay, use_packed_fma,
+                            )
+                            r_h[1, i], r_h[1, i + 1] = la_update_pair(
+                                r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1],
+                                r_v_1, r_decay, use_packed_fma,
+                            )
+                            r_h[2, i], r_h[2, i + 1] = la_update_pair(
+                                r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1],
+                                r_v_2, r_decay, use_packed_fma,
+                            )
+                            r_h[3, i], r_h[3, i + 1] = la_update_pair(
+                                r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1],
+                                r_v_3, r_decay, use_packed_fma,
+                            )
+                            r_h[4, i], r_h[4, i + 1] = la_update_pair(
+                                r_h[4, i], r_h[4, i + 1], r_k[i], r_k[i + 1],
+                                r_v_4, r_decay, use_packed_fma,
+                            )
+                            r_h[5, i], r_h[5, i + 1] = la_update_pair(
+                                r_h[5, i], r_h[5, i + 1], r_k[i], r_k[i + 1],
+                                r_v_5, r_decay, use_packed_fma,
+                            )
+                            r_h[6, i], r_h[6, i + 1] = la_update_pair(
+                                r_h[6, i], r_h[6, i + 1], r_k[i], r_k[i + 1],
+                                r_v_6, r_decay, use_packed_fma,
+                            )
+                            r_h[7, i], r_h[7, i + 1] = la_update_pair(
+                                r_h[7, i], r_h[7, i + 1], r_k[i], r_k[i + 1],
+                                r_v_7, r_decay, use_packed_fma,
+                            )
 
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
@@ -507,23 +628,55 @@ def la_verify_kernel_mtp(
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (j, None)), inter_tile_j)
 
-                        sum_hq_0 = cutlass.Float32(0.0)
-                        sum_hq_1 = cutlass.Float32(0.0)
-                        sum_hq_2 = cutlass.Float32(0.0)
-                        sum_hq_3 = cutlass.Float32(0.0)
-                        sum_hq_4 = cutlass.Float32(0.0)
-                        sum_hq_5 = cutlass.Float32(0.0)
-                        sum_hq_6 = cutlass.Float32(0.0)
-                        sum_hq_7 = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_0 += r_h[0, i] * r_q[i]
-                            sum_hq_1 += r_h[1, i] * r_q[i]
-                            sum_hq_2 += r_h[2, i] * r_q[i]
-                            sum_hq_3 += r_h[3, i] * r_q[i]
-                            sum_hq_4 += r_h[4, i] * r_q[i]
-                            sum_hq_5 += r_h[5, i] * r_q[i]
-                            sum_hq_6 += r_h[6, i] * r_q[i]
-                            sum_hq_7 += r_h[7, i] * r_q[i]
+                        sum_hq_0_lo = cutlass.Float32(0.0); sum_hq_0_hi = cutlass.Float32(0.0)
+                        sum_hq_1_lo = cutlass.Float32(0.0); sum_hq_1_hi = cutlass.Float32(0.0)
+                        sum_hq_2_lo = cutlass.Float32(0.0); sum_hq_2_hi = cutlass.Float32(0.0)
+                        sum_hq_3_lo = cutlass.Float32(0.0); sum_hq_3_hi = cutlass.Float32(0.0)
+                        sum_hq_4_lo = cutlass.Float32(0.0); sum_hq_4_hi = cutlass.Float32(0.0)
+                        sum_hq_5_lo = cutlass.Float32(0.0); sum_hq_5_hi = cutlass.Float32(0.0)
+                        sum_hq_6_lo = cutlass.Float32(0.0); sum_hq_6_hi = cutlass.Float32(0.0)
+                        sum_hq_7_lo = cutlass.Float32(0.0); sum_hq_7_hi = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            sum_hq_0_lo, sum_hq_0_hi = hq_dot_pair(
+                                r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_0_lo, sum_hq_0_hi, use_packed_fma,
+                            )
+                            sum_hq_1_lo, sum_hq_1_hi = hq_dot_pair(
+                                r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_1_lo, sum_hq_1_hi, use_packed_fma,
+                            )
+                            sum_hq_2_lo, sum_hq_2_hi = hq_dot_pair(
+                                r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_2_lo, sum_hq_2_hi, use_packed_fma,
+                            )
+                            sum_hq_3_lo, sum_hq_3_hi = hq_dot_pair(
+                                r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_3_lo, sum_hq_3_hi, use_packed_fma,
+                            )
+                            sum_hq_4_lo, sum_hq_4_hi = hq_dot_pair(
+                                r_h[4, i], r_h[4, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_4_lo, sum_hq_4_hi, use_packed_fma,
+                            )
+                            sum_hq_5_lo, sum_hq_5_hi = hq_dot_pair(
+                                r_h[5, i], r_h[5, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_5_lo, sum_hq_5_hi, use_packed_fma,
+                            )
+                            sum_hq_6_lo, sum_hq_6_hi = hq_dot_pair(
+                                r_h[6, i], r_h[6, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_6_lo, sum_hq_6_hi, use_packed_fma,
+                            )
+                            sum_hq_7_lo, sum_hq_7_hi = hq_dot_pair(
+                                r_h[7, i], r_h[7, i + 1], r_q[i], r_q[i + 1],
+                                sum_hq_7_lo, sum_hq_7_hi, use_packed_fma,
+                            )
+                        sum_hq_0 = sum_hq_0_lo + sum_hq_0_hi
+                        sum_hq_1 = sum_hq_1_lo + sum_hq_1_hi
+                        sum_hq_2 = sum_hq_2_lo + sum_hq_2_hi
+                        sum_hq_3 = sum_hq_3_lo + sum_hq_3_hi
+                        sum_hq_4 = sum_hq_4_lo + sum_hq_4_hi
+                        sum_hq_5 = sum_hq_5_lo + sum_hq_5_hi
+                        sum_hq_6 = sum_hq_6_lo + sum_hq_6_hi
+                        sum_hq_7 = sum_hq_7_lo + sum_hq_7_hi
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hq_0 += cute.arch.shuffle_sync_bfly(
                                 sum_hq_0, offset=offset, mask=-1, mask_and_clamp=31

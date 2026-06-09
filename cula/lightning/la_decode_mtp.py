@@ -860,7 +860,7 @@ def linear_attention_decode_mtp(
     out: torch.Tensor,                  # [B, T, HV, V] bf16
     decay_scales: torch.Tensor,         # [H] fp32
     s_offsets: torch.Tensor,            # [B] int32 (-1 to skip)
-    cu_seqlens: torch.Tensor,           # [B+1] int32 (dummy if not is_varlen)
+    cu_seqlens: torch.Tensor,           # [B+1] int32 (reserved; see note below)
     softmax_scale: float,
     T: int,
     cache_intermediate_states: bool,
@@ -872,6 +872,11 @@ def linear_attention_decode_mtp(
 
     Writes to ``out``; updates ``s`` in place unless ``disable_state_update`` is True;
     writes ``intermediate_states`` when ``cache_intermediate_states`` is True.
+
+    NOTE: ``is_varlen`` and ``cu_seqlens`` are reserved in the signature to keep the
+    public API stable, but the early-stop branch is NOT implemented yet — same as
+    upstream flashinfer GDN MTP, which also exposes the flag without consuming it.
+    Callers should pass ``is_varlen=False`` and any int32 tensor for ``cu_seqlens``.
     """
     B, T_q, H, K = q.shape
     assert T_q == T, f"q.shape[1]={T_q} doesn't match T={T}"

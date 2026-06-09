@@ -180,12 +180,27 @@ def run_la_mtp(
 # ---------------------------------------------------------------------------
 # Tests vs PyTorch reference
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("T", [2, 4])
-@pytest.mark.parametrize("B", [4])
-def test_output_vs_torch_ref(B, T):
-    """Step 2 baseline: B=4, T∈{2,4}, H=HV=16, D=128 — ILP=4 hardcoded path."""
+# Each (B, T) below targets a distinct heuristic config (with H=HV=64):
+#   B=1,  T=4: work_units=64   → tile_v=8,  ilp=2, smem_v=False
+#   B=2,  T=2: work_units=128  → tile_v=16, ilp=4, smem_v=False
+#   B=2,  T=4: work_units=128  → tile_v=16, ilp=4, smem_v=False
+#   B=8,  T=4: work_units=512  → tile_v=32, ilp=4, smem_v=False
+#   B=32, T=2: work_units=2048 → tile_v=64, ilp=8, smem_v=False  (state_update ON)
+#   B=32, T=4: work_units=2048 → tile_v=64, ilp=4, smem_v=True
+@pytest.mark.parametrize(
+    "B,T,expected_config",
+    [
+        (1,  4, "tile_v=8_ilp=2"),
+        (2,  2, "tile_v=16_ilp=4"),
+        (2,  4, "tile_v=16_ilp=4"),
+        (8,  4, "tile_v=32_ilp=4"),
+        (32, 2, "tile_v=64_ilp=8"),
+        (32, 4, "tile_v=64_ilp=4_smem_v"),
+    ],
+)
+def test_output_vs_torch_ref(B, T, expected_config):
     _skip_if_no_sm90_or_later()
-    H, HV, D = 16, 16, 128
+    H, HV, D = 64, 64, 128
     scale = D**-0.5
     decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
 
@@ -197,13 +212,137 @@ def test_output_vs_torch_ref(B, T):
     rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
     max_ref = torch.abs(o_ref.float()).max().item()
     rel = rmse / (max_ref + 1e-8)
-    assert rel < 0.01, f"B={B} T={T}: output rel RMSE {rel:.6f} too large"
+    assert rel < 0.01, f"B={B} T={T} [{expected_config}]: output rel RMSE {rel:.6f} too large"
 
     # State check
     state_rmse = torch.sqrt(torch.mean((state_cute - state_ref) ** 2)).item()
     state_max = torch.abs(state_ref).max().item()
     state_rel = state_rmse / (state_max + 1e-8)
-    assert state_rel < 0.001, f"B={B} T={T}: state rel RMSE {state_rel:.6f} too large"
+    assert state_rel < 0.001, f"B={B} T={T} [{expected_config}]: state rel RMSE {state_rel:.6f} too large"
+
+
+@pytest.mark.parametrize("H,HV", [(16, 16), (8, 32), (16, 64)])  # MHA + GQA
+def test_different_heads(H, HV):
+    """GQA support: HV is multiple of H; q/k indexed by i_h = i_hv // (HV//H)."""
+    _skip_if_no_sm90_or_later()
+    B, T, D = 4, 4, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    o_ref, state_ref, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+    o_cute, state_cute, _ = run_la_mtp(q, k, v, state, decay_scales, scale, T)
+
+    rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
+    max_ref = torch.abs(o_ref.float()).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.01, f"H={H} HV={HV}: output mismatch"
+
+    state_rmse = torch.sqrt(torch.mean((state_cute - state_ref) ** 2)).item()
+    state_max = torch.abs(state_ref).max().item()
+    assert state_rmse / (state_max + 1e-8) < 0.001, f"H={H} HV={HV}: state mismatch"
+
+
+def test_disable_state_update():
+    """h0_source remains bitwise-equal to the input snapshot."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    state_snapshot = state.clone()
+
+    _, state_out, _ = run_la_mtp(
+        q, k, v, state, decay_scales, scale, T,
+        disable_state_update=True,
+    )
+    assert torch.equal(state_out, state_snapshot), "state was mutated despite disable_state_update=True"
+
+
+def test_cache_intermediate_states():
+    """Each per-t slice of inter matches the reference state_running at that step."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    _, _, inter_ref = torch_la_mtp_ref(
+        q, k, v, state, decay_scales, scale, T, cache_intermediate_states=True,
+    )
+    _, _, inter_cute = run_la_mtp(
+        q, k, v, state, decay_scales, scale, T, cache_intermediate_states=True,
+    )
+
+    rmse = torch.sqrt(torch.mean((inter_cute - inter_ref) ** 2)).item()
+    max_ref = torch.abs(inter_ref).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.001, f"intermediate states mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
+
+
+def test_skip_with_negative_offset():
+    """s_offsets[i]=-1: that batch's `out` slot stays at initial value."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    sentinel = 123.0
+    out = torch.full((B, T, HV, D), sentinel, device=q.device, dtype=torch.bfloat16)
+    s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
+    s_offsets[2] = -1  # skip batch index 2
+
+    inter = torch.empty(1, 1, 1, device=q.device, dtype=torch.float32)
+    cu_seqlens = torch.empty(1, device=q.device, dtype=torch.int32)
+    linear_attention_decode_mtp(
+        q, k, v, s_cute, inter, out,
+        decay_scales=decay_scales,
+        s_offsets=s_offsets,
+        cu_seqlens=cu_seqlens,
+        softmax_scale=scale,
+        T=T,
+        cache_intermediate_states=False,
+        disable_state_update=False,
+        is_varlen=False,
+    )
+    # batch 2 should be untouched (sentinel value)
+    assert torch.all(out[2] == torch.full_like(out[2], sentinel)), "skipped batch was modified"
+    # other batches should differ from sentinel
+    assert not torch.all(out[0] == torch.full_like(out[0], sentinel)), "non-skipped batch unchanged"
+
+
+def test_zero_decay():
+    """With decay=0: state_new = state_old + k⊗v (no decay applied)."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = torch.zeros(H, device="cuda", dtype=torch.float32)
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    o_ref, _, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+    o_cute, _, _ = run_la_mtp(q, k, v, state, decay_scales, scale, T)
+
+    rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
+    max_ref = torch.abs(o_ref.float()).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.01, "zero decay: output mismatch"
+
+
+def test_zero_state():
+    """With zero initial state."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.ones(H, device="cuda", dtype=torch.float32)
+
+    q, k, v, _ = make_inputs(B, T, H, HV, D)
+    state = torch.zeros(B, HV, D, D, device="cuda", dtype=torch.float32)
+    o_ref, _, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+    o_cute, _, _ = run_la_mtp(q, k, v, state, decay_scales, scale, T)
+
+    rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
+    max_ref = torch.abs(o_ref.float()).max().item()
+    assert rmse / (max_ref + 1e-8) < 0.01, "zero state: output mismatch"
 
 
 if __name__ == "__main__":

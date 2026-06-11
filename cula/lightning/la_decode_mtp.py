@@ -23,7 +23,7 @@ Per timestep:
     o_t = (h_t @ q_t) * softmax_scale
 
 `decay_scales` is per-head and time-invariant, so `r_decay` is computed ONCE
-outside the T-loop (the structural simplification vs GDN's per-t softplus/sigmoid).
+outside the T-loop.
 
 Grid: (B * HV * num_v_tiles, 1, 1). Each block handles one [tile_v] slice
 across all T timesteps; h for that slice stays in registers.
@@ -86,6 +86,11 @@ def hq_dot_pair(h_lo, h_hi, q_lo, q_hi, sum_lo, sum_hi, use_packed_fma: cutlass.
 
 
 # TODO: re-tune for LA after first benchmark.
+# TODO (perf): for configs with row_iters > 1 (e.g. tile_v=64, ilp=4), q/k are
+# reloaded from global on every row-loop iteration because the row-outer / T-inner
+# structure is required to keep h register-resident across T (r_h budget is 8 rows).
+# Stage q/k in SMEM per i_t (cooperative load + barrier) to avoid the (row_iters - 1)
+# redundant reads; worst case (tile_v=64, ilp=4) wastes 3x the q/k bandwidth.
 def get_mtp_config(B: int, T: int, HV: int, V: int, disable_state_update: bool) -> tuple:
     """Pick (tile_v, vec_size, ilp_rows, use_smem_v) based on work units.
 
@@ -116,6 +121,11 @@ def get_mtp_config(B: int, T: int, HV: int, V: int, disable_state_update: bool) 
             use_smem_v = False
 
     tile_v = min(tile_v, V)
+    rows_per_group = tile_v // 4
+    assert rows_per_group % ilp_rows == 0, (
+        f"tile_v={tile_v} / num_groups=4 / ilp_rows={ilp_rows} doesn't divide cleanly "
+        f"(rows_per_group={rows_per_group}); the ILP loop would run zero iterations."
+    )
     return tile_v, vec_size, ilp_rows, use_smem_v
 
 
@@ -873,10 +883,19 @@ def linear_attention_decode_mtp(
     Writes to ``out``; updates ``s`` in place unless ``disable_state_update`` is True;
     writes ``intermediate_states`` when ``cache_intermediate_states`` is True.
 
+    NOTE: For any batch ``i`` where ``s_offsets[i] < 0`` the kernel skips that batch
+    entirely — ``out[i]`` is LEFT UNCHANGED, and neither ``s`` nor
+    ``intermediate_states`` is written for that slot. Callers must initialize ``out``
+    to a known value (e.g. ``torch.zeros``) before the call if any downstream code
+    may read those slots.
+
     NOTE: ``is_varlen`` and ``cu_seqlens`` are reserved in the signature to keep the
     public API stable, but the early-stop branch is NOT implemented yet — same as
     upstream flashinfer GDN MTP, which also exposes the flag without consuming it.
     Callers should pass ``is_varlen=False`` and any int32 tensor for ``cu_seqlens``.
+    The kernel descriptor is built with ``assumed_align=16``, so even the dummy
+    ``cu_seqlens`` must be 16-byte aligned; pass a fresh ``torch.empty(N, dtype=int32)``
+    (CUDA allocator guarantees alignment) — do NOT pass a slice that may misalign.
     """
     B, T_q, H, K = q.shape
     assert T_q == T, f"q.shape[1]={T_q} doesn't match T={T}"
@@ -885,8 +904,6 @@ def linear_attention_decode_mtp(
 
     tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     major, _ = get_device_sm_version(q.device)
-    # TODO step 7: kernel currently has scalar-FMA only; once packed_fma_f32x2
-    # branch lands, this enables it on SM100+.
     use_packed_fma = major >= 10
 
     cache_key = (

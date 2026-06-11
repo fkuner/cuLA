@@ -278,6 +278,20 @@ def test_cache_intermediate_states():
     max_ref = torch.abs(inter_ref).max().item()
     assert rmse / (max_ref + 1e-8) < 0.001, f"intermediate states mismatch, rel_rmse={rmse / (max_ref + 1e-8):.6f}"
 
+    inter_cute_v = inter_cute.view(B, T, HV, D, D)
+    inter_ref_v = inter_ref.view(B, T, HV, D, D)
+    for b in range(B):
+        for t in range(T):
+            slot_c = inter_cute_v[b, t]
+            slot_r = inter_ref_v[b, t]
+            slot_rmse = torch.sqrt(torch.mean((slot_c - slot_r) ** 2)).item()
+            slot_max = torch.abs(slot_r).max().item()
+            assert slot_rmse / (slot_max + 1e-8) < 0.001, (
+                f"(b={b}, t={t}) intermediate mismatch, rel_rmse={slot_rmse / (slot_max + 1e-8):.6f}"
+            )
+
+    assert not torch.allclose(inter_cute_v[0, 0], inter_cute_v[0, 1])
+
 
 def test_skip_with_negative_offset():
     """s_offsets[i]=-1: that batch's `out` slot stays at initial value."""
@@ -310,6 +324,46 @@ def test_skip_with_negative_offset():
     assert torch.all(out[2] == torch.full_like(out[2], sentinel)), "skipped batch was modified"
     # other batches should differ from sentinel
     assert not torch.all(out[0] == torch.full_like(out[0], sentinel)), "non-skipped batch unchanged"
+
+
+def test_skip_with_negative_offset_cache_intermediate():
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device=q.device, dtype=torch.bfloat16)
+    s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
+    s_offsets[2] = -1
+
+    inter_sentinel = 7.5
+    inter = torch.full(
+        (B * T * HV, D, D), inter_sentinel, device=q.device, dtype=torch.float32
+    )
+    cu_seqlens = torch.empty(1, device=q.device, dtype=torch.int32)
+
+    linear_attention_decode_mtp(
+        q, k, v, s_cute, inter, out,
+        decay_scales=decay_scales,
+        s_offsets=s_offsets,
+        cu_seqlens=cu_seqlens,
+        softmax_scale=scale,
+        T=T,
+        cache_intermediate_states=True,
+        disable_state_update=False,
+        is_varlen=False,
+    )
+
+    skipped = inter[2 * T * HV : 3 * T * HV]
+    assert torch.all(skipped == inter_sentinel), (
+        f"intermediate_states for skipped batch was written "
+        f"(min={skipped.min().item()}, max={skipped.max().item()})"
+    )
+
+    others = torch.cat([inter[: 2 * T * HV], inter[3 * T * HV :]], dim=0)
+    assert not torch.all(others == inter_sentinel), "non-skipped intermediate slots were not written"
 
 
 def test_zero_decay():

@@ -297,8 +297,8 @@ def main():
     parser.add_argument("--num-layers", type=int, default=24)
     parser.add_argument("--peak-bps", type=float, default=8e12,
                         help="HBM peak bytes/sec for SOL%% (B200 HBM3e ≈ 8e12)")
-    parser.add_argument("--cache-intermediate", action="store_true")
-    parser.add_argument("--disable-state-update", action="store_true")
+    parser.add_argument("--cache-intermediate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--disable-state-update", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     H = args.heads

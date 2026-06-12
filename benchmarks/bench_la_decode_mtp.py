@@ -50,8 +50,8 @@ try:
 except ImportError:
     HAS_FLA = False
 
-from cula.lightning.la_decode import _get_compiled_kernel as _get_la_decode_cache
-from cula.lightning.la_decode import linear_attention_decode
+from cula.ops.la_decode import _get_compiled_kernel as _get_la_decode_cache
+from cula.ops.la_decode import linear_attention_decode
 from cula.lightning.la_decode_mtp import (
     _get_compiled_la_mtp_kernel,
     get_mtp_config,

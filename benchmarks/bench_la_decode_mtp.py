@@ -195,14 +195,14 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
     # cula T-sequential baseline: T calls to la_decode (T=1 each)
     state_seq = state_init.clone().permute(0, 1, 3, 2).contiguous().view(B * HV, V, K)
     out_seq_buf = torch.empty(B, HV, V, device=device, dtype=dtype)
+    q_slices = [q_4d[:, t].contiguous() for t in range(T)]
+    k_slices = [k_4d[:, t].contiguous() for t in range(T)]
+    v_slices = [v_4d[:, t].contiguous() for t in range(T)]
 
     def kernel_cute_seq():
         for t in range(T):
-            q_t = q_4d[:, t]   # [B, H, K]
-            k_t = k_4d[:, t]
-            v_t = v_4d[:, t]
             linear_attention_decode(
-                q_t, k_t, v_t, state_seq, out_seq_buf,
+                q_slices[t], k_slices[t], v_slices[t], state_seq, out_seq_buf,
                 softmax_scale=scale,
                 stride_q=0, stride_k=0, stride_v=0, stride_s=0, stride_o=0,
                 s_offsets=s_offsets,

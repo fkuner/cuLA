@@ -40,6 +40,7 @@ from cula.utils import USE_FAST_MATH, get_device_sm_version
 from cula.lightning.la_decode_mtp import (
     NUM_THREADS_MTP,
     get_mtp_config,
+    hq_dot_pair,
 )
 
 
@@ -66,8 +67,108 @@ def la_verify_kvbuffer_kernel(
     use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
 ):
-    # KERNEL BODY FILLED IN TASK 5.
-    return
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size           # 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group   # 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp            # 4
+
+    lane_in_group = lane_id % threads_per_group
+    group_in_warp = lane_id // threads_per_group
+    group_idx = warp_idx * groups_per_warp + group_in_warp
+
+    block_idx, _, _ = cute.arch.block_idx()
+    i_v = block_idx % num_v_tiles
+    tmp = block_idx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+
+    r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_q_seq = cute.make_rmem_tensor(cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32)
+    r_k_seq = cute.make_rmem_tensor(cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32)
+    r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
+    r_v_seq = cute.make_rmem_tensor(cute.make_layout((T, 8), stride=(8, 1)), cutlass.Float32)
+    r_decay_pow = cute.make_rmem_tensor(cute.make_layout((T + 1,), stride=(1,)), cutlass.Float32)
+    o_partial = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
+
+    if cache_idx >= 0:
+        alpha = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
+
+        # alpha^0 .. alpha^T  (T+1 powers; term1 uses alpha^{t+1})
+        r_decay_pow[0] = cutlass.Float32(1.0)
+        for t in cutlass.range_constexpr(1, T + 1):
+            r_decay_pow[t] = r_decay_pow[t - 1] * alpha
+
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+        flat_state_idx = cache_idx * HV + i_hv
+
+        # Stage all T q (scaled) and k (fp32) for this lane's K-slice.
+        for t in cutlass.range_constexpr(T):
+            q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t, i_h, lane_in_group))
+            k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t, i_h, lane_in_group))
+            cute.autovec_copy(q_tile, r_q_bf16)
+            cute.autovec_copy(k_tile, r_k_bf16)
+            for j in cutlass.range_constexpr(vec_size):
+                r_q_seq[t, j] = cutlass.Float32(r_q_bf16[j]) * scale
+                r_k_seq[t, j] = cutlass.Float32(r_k_bf16[j])
+
+        num_row_blocks: cutlass.Constexpr[int] = rows_per_group // ilp_rows
+        for row_block in cutlass.range_constexpr(num_row_blocks):
+            v_base = i_v * tile_v + group_idx * rows_per_group + row_block * ilp_rows
+            if v_base + (ilp_rows - 1) < V:
+                # Load h_init rows (persistent across the T loop).
+                for slot in cutlass.range_constexpr(ilp_rows):
+                    h_tile = cute.local_tile(
+                        h0_source, (1, 1, vec_size), (flat_state_idx, v_base + slot, lane_in_group))
+                    cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
+
+                # Load all T v-values for these rows.
+                for t in cutlass.range_constexpr(T):
+                    for slot in cutlass.range_constexpr(ilp_rows):
+                        r_v_seq[t, slot] = cutlass.Float32(v[i_n, t, i_hv, v_base + slot])
+
+                for t in cutlass.range_constexpr(T):
+                    # term1: alpha^{t+1} * (h_init @ q_t)  (per-slot warp reduce)
+                    for slot in cutlass.range_constexpr(ilp_rows):
+                        hq_lo = cutlass.Float32(0.0)
+                        hq_hi = cutlass.Float32(0.0)
+                        for j in cutlass.range_constexpr(0, vec_size, 2):
+                            hq_lo, hq_hi = hq_dot_pair(
+                                r_h[slot, j], r_h[slot, j + 1],
+                                r_q_seq[t, j], r_q_seq[t, j + 1],
+                                hq_lo, hq_hi, use_packed_fma)
+                        hq = hq_lo + hq_hi
+                        for offset in [16, 8, 4, 2, 1]:
+                            hq += cute.arch.shuffle_sync_bfly(hq, offset=offset, mask=-1, mask_and_clamp=31)
+                        o_partial[slot] = r_decay_pow[t + 1] * hq
+
+                    # term2: sum_{i=0..t} alpha^{t-i} * (q_t . k_i) * v_i
+                    for i in cutlass.range_constexpr(t + 1):
+                        qk_lo = cutlass.Float32(0.0)
+                        qk_hi = cutlass.Float32(0.0)
+                        for j in cutlass.range_constexpr(0, vec_size, 2):
+                            qk_lo, qk_hi = hq_dot_pair(
+                                r_q_seq[t, j], r_q_seq[t, j + 1],
+                                r_k_seq[i, j], r_k_seq[i, j + 1],
+                                qk_lo, qk_hi, use_packed_fma)
+                        qk = qk_lo + qk_hi
+                        for offset in [16, 8, 4, 2, 1]:
+                            qk += cute.arch.shuffle_sync_bfly(qk, offset=offset, mask=-1, mask_and_clamp=31)
+                        coeff = r_decay_pow[t - i] * qk
+                        for slot in cutlass.range_constexpr(ilp_rows):
+                            o_partial[slot] = o_partial[slot] + coeff * r_v_seq[i, slot]
+
+                    # writeback (all lanes hold the reduced value; lane 0 writes)
+                    if lane_in_group == 0:
+                        for slot in cutlass.range_constexpr(ilp_rows):
+                            o[(i_n, t, i_hv, v_base + slot)] = cutlass.BFloat16(o_partial[slot])
 
 
 @cute.jit

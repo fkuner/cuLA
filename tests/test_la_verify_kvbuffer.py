@@ -185,3 +185,78 @@ def test_verify_skip_negative_h0_indices():
         q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
     )
     assert torch.all(out[2] == sentinel), "skipped batch out slot was modified"
+
+
+@pytest.mark.parametrize("B,T", [(1, 4), (2, 2), (2, 4), (8, 4), (32, 2), (32, 4)])
+def test_verify_outputs_match_ref(B, T):
+    """Verify kernel o matches torch_la_mtp_ref across the baseline configs."""
+    _skip_if_no_sm90_or_later()
+    H, HV, D = 64, 64, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    o_ref, _, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+    )
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
+        torch.abs(o_ref.float()).max().item() + 1e-8)
+    assert rel < 1e-2, f"B={B} T={T}: verify output rel RMSE {rel:.6f} too large"
+
+
+@pytest.mark.parametrize("H,HV", [(16, 16), (8, 32), (16, 64)])
+def test_verify_different_heads(H, HV):
+    _skip_if_no_sm90_or_later()
+    B, T, D = 4, 4, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+    o_ref, _, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+    )
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
+        torch.abs(o_ref.float()).max().item() + 1e-8)
+    assert rel < 1e-2, f"H={H} HV={HV}: verify output mismatch {rel:.6f}"
+
+
+def test_verify_zero_decay():
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = torch.zeros(H, device="cuda", dtype=torch.float32)
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+    o_ref, _, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    linear_attention_verify_kvbuffer(q, k, v, s_cute, out, decay_scales, h0_indices, scale, T)
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
+        torch.abs(o_ref.float()).max().item() + 1e-8)
+    assert rel < 1e-2, f"zero decay: {rel:.6f}"
+
+
+def test_verify_zero_state():
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.ones(H, device="cuda", dtype=torch.float32)
+    q, k, v, _ = _make_inputs(B, T, H, HV, D)
+    state = torch.zeros(B, HV, D, D, device="cuda", dtype=torch.float32)
+    o_ref, _, _ = torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T)
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    linear_attention_verify_kvbuffer(q, k, v, s_cute, out, decay_scales, h0_indices, scale, T)
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
+        torch.abs(o_ref.float()).max().item() + 1e-8)
+    assert rel < 1e-2, f"zero state: {rel:.6f}"

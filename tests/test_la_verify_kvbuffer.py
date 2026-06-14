@@ -162,3 +162,26 @@ def test_state_update_skip_negative_h0_indices():
         k, v, s_cute, decay_scales, h0_indices, L_per_batch, T,
     )
     assert torch.equal(s_cute[2], snapshot_b2), "skipped batch slot was modified"
+
+
+from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
+
+
+def test_verify_skip_negative_h0_indices():
+    """h0_indices[b]=-1: out[b] stays at its sentinel value."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    sentinel = 123.0
+    out = torch.full((B, T, HV, D), sentinel, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    h0_indices[2] = -1
+
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+    )
+    assert torch.all(out[2] == sentinel), "skipped batch out slot was modified"

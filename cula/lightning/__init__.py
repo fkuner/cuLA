@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
+from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
 from cula.lightning.la_state_update_kvbuffer import linear_attention_state_update_kvbuffer
 from cula.ops.la_decode import linear_attention_decode
 from cula.ops.lightning_attn import (
@@ -27,5 +28,6 @@ __all__ = [
     "lightning_attn_fwd_varlen",
     "linear_attention_decode",
     "linear_attention_decode_mtp",
+    "linear_attention_verify_kvbuffer",
     "linear_attention_state_update_kvbuffer",
 ]

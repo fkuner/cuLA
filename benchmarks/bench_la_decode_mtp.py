@@ -57,6 +57,8 @@ from cula.lightning.la_decode_mtp import (
     get_mtp_config,
     linear_attention_decode_mtp,
 )
+from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
+from cula.lightning.la_state_update_kvbuffer import linear_attention_state_update_kvbuffer
 from cula.utils import USE_FAST_MATH, get_device_sm_version
 
 
@@ -94,6 +96,16 @@ def la_mtp_bytes(B, T, H, HV, K, V, cache_intermediate_states, disable_state_upd
     h0_w  = 0 if disable_state_update else B * HV * V * K * fp32       # h0 writes
     inter = B * T * HV * V * K * fp32 if cache_intermediate_states else 0
     return qkv + out_w + h0_r + h0_w + inter
+
+
+def kvbuf_bytes(B, T, H, HV, K, V):
+    """DRAM traffic for verify + state-update (worst case L=T). Spec §8."""
+    bf16, fp32 = 2, 4
+    qkv    = B * T * H * K * bf16 * 2 + B * T * HV * V * bf16   # q,k,v reads (verify)
+    out_w  = B * T * HV * V * bf16                              # o writes (verify)
+    h0_r   = B * HV * V * K * fp32                              # h0 reads (verify)
+    update = B * HV * V * K * fp32 * 2 + B * T * H * K * bf16 + B * T * HV * V * bf16
+    return qkv + out_w + h0_r + update
 
 
 def sol_pct(byte_count: int, kernel_ms: float, peak_bps: float) -> float:
@@ -215,6 +227,30 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
         cute_mtp_ms = benchmark_fn(kernel_cute_mtp)
         cute_seq_ms = benchmark_fn(kernel_cute_seq)
 
+    # ── KVBuffer verify + state-update (kernel-only via Python wrapper) ──
+    s_kvbuf_verify = state_init.clone().permute(0, 1, 3, 2).contiguous()   # [B,HV,V,K]
+    out_kvbuf = torch.empty(B, T, HV, V, device=device, dtype=dtype)
+    h0_indices_kv = torch.arange(B, device=device, dtype=torch.int32)
+    accepted_len_kv = torch.full((B,), T, device=device, dtype=torch.int32)
+    s_kvbuf_update = state_init.clone().permute(0, 1, 3, 2).contiguous()   # [B,HV,V,K]
+
+    def kernel_kvbuf_verify():
+        linear_attention_verify_kvbuffer(
+            q_4d, k_4d, v_4d, s_kvbuf_verify, out_kvbuf,
+            decay_scales, h0_indices_kv, scale, T,
+        )
+
+    def kernel_kvbuf_update():
+        linear_attention_state_update_kvbuffer(
+            k_4d, v_4d, s_kvbuf_update, decay_scales,
+            h0_indices_kv, accepted_len_kv, T,
+        )
+
+    with torch.no_grad():
+        kvbuf_verify_ms = benchmark_fn(kernel_kvbuf_verify)
+        kvbuf_update_ms = benchmark_fn(kernel_kvbuf_update)
+    kvbuf_total_ms = kvbuf_verify_ms + kvbuf_update_ms
+
     # ==================================================================
     # Mode 2: WRAPPER — full Python entry path (cache lookup + CUstream per call)
     # ==================================================================
@@ -263,12 +299,21 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
     )
     sol = sol_pct(bytes_moved, cute_mtp_ms, peak_bps)
 
+    kvbuf_bytes_moved = kvbuf_bytes(B, T, H, HV, K, V)
+    kvbuf_sol = sol_pct(kvbuf_bytes_moved, kvbuf_total_ms, peak_bps)
+    spd_kvbuf = cute_mtp_ms / kvbuf_total_ms
+
     speedup_seq = cute_seq_ms / cute_mtp_ms
     speedup_fla = fla_ms / cute_mtp_ms if HAS_FLA else float("nan")
 
     return {
         "B": B, "T": T,
         "cute_mtp_ms": cute_mtp_ms,
+        "kvbuf_verify_ms": kvbuf_verify_ms,
+        "kvbuf_update_ms": kvbuf_update_ms,
+        "kvbuf_total_ms": kvbuf_total_ms,
+        "spd_kvbuf": spd_kvbuf,
+        "kvbuf_sol_pct": kvbuf_sol,
         "cute_seq_ms": cute_seq_ms,
         "fla_ms": fla_ms,
         "wrap_cute_ms": wrap_cute_ms,
@@ -320,6 +365,7 @@ def main():
         f"{'B':>4} | {'T':>3} | {'cute_mtp(ms)':>12} | {'cute×T(ms)':>10} | "
         f"{'fla(ms)':>9} | {'spd_seq':>7} | {'spd_fla':>7} | "
         f"{'wrap(ms)':>9} | {'SOL%':>5} | {'GB':>6} | {'RMSE':>9}"
+        f" | {'kvbuf(ms)':>9} | {'spd_kv':>6} | {'kvSOL%':>6}"
     )
     print(f"\n{cols}")
     print("─" * len(cols))
@@ -340,6 +386,7 @@ def main():
                 f"{(r['speedup_fla'] if fla_avail else float('nan')):>6.2f}x | "
                 f"{r['wrap_cute_ms']:>9.4f} | {r['sol_pct']:>5.1f} | "
                 f"{r['bytes_GB']:>6.3f} | {r['rmse']:>9.6f}"
+                f" | {r['kvbuf_total_ms']:>9.4f} | {r['spd_kvbuf']:>5.2f}x | {r['kvbuf_sol_pct']:>6.1f}"
             )
         print()
 
@@ -351,6 +398,8 @@ def main():
     print("  spd_fla   : fla / cute_mtp     (vs industry reference)")
     print("  wrap(ms)  : cute_mtp full Python entry (cache lookup + CUstream + kernel)")
     print(f"  SOL%      : (bytes / kernel_ms) / peak_bps × 100  (peak = {args.peak_bps:.2e} B/s)")
+    print("  kvbuf     : linear_attention_verify_kvbuffer + _state_update_kvbuffer (L=T worst case)")
+    print("  spd_kv    : cute_mtp / kvbuf_total  (KVBuffer speedup vs baseline)")
 
 
 if __name__ == "__main__":

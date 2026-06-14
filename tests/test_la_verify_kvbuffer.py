@@ -260,3 +260,52 @@ def test_verify_zero_state():
     rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
         torch.abs(o_ref.float()).max().item() + 1e-8)
     assert rel < 1e-2, f"zero state: {rel:.6f}"
+
+
+from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
+
+
+def test_end_to_end_equivalence_with_baseline():
+    """KVBuffer (verify + state_update L=T) == baseline (cache_inter=T, disable=T)."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 8, 4, 64, 64, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    # ---- Baseline: capture out + all intermediate states ----
+    s_base = state.permute(0, 1, 3, 2).contiguous().clone()  # [B,HV,V,K]
+    out_base = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    s_offsets = torch.arange(B, device="cuda", dtype=torch.int32)
+    inter = torch.zeros(B * T * HV, D, D, device="cuda", dtype=torch.float32)  # [.,V,K]
+    cu_seqlens = torch.empty(1, device="cuda", dtype=torch.int32)
+    linear_attention_decode_mtp(
+        q, k, v, s_base, inter, out_base,
+        decay_scales=decay_scales, s_offsets=s_offsets, cu_seqlens=cu_seqlens,
+        softmax_scale=scale, T=T,
+        cache_intermediate_states=True, disable_state_update=True, is_varlen=False,
+    )
+
+    # ---- KVBuffer: verify writes out; state-update (L=T) writes state ----
+    s_kv = state.permute(0, 1, 3, 2).contiguous().clone()  # [B,HV,V,K]
+    out_kv = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_kv, out_kv, decay_scales, h0_indices, scale, T,
+    )
+    accepted_len = torch.full((B,), T, device="cuda", dtype=torch.int32)
+    linear_attention_state_update_kvbuffer(
+        k, v, s_kv, decay_scales, h0_indices, accepted_len, T,
+    )
+
+    # (a) outputs match
+    rel_o = torch.sqrt(torch.mean((out_kv.float() - out_base.float()) ** 2)).item() / (
+        torch.abs(out_base.float()).max().item() + 1e-8)
+    assert rel_o < 1e-2, f"output mismatch vs baseline: {rel_o:.6f}"
+
+    # (b) updated state == baseline's last intermediate slice [B,HV,V,K]
+    inter_v = inter.view(B, T, HV, D, D)            # [B,T,HV,V,K]
+    last_state = inter_v[:, T - 1]                  # [B,HV,V,K]
+    rel_s = torch.sqrt(torch.mean((s_kv - last_state) ** 2)).item() / (
+        torch.abs(last_state).max().item() + 1e-8)
+    assert rel_s < 1e-3, f"state mismatch vs baseline last intermediate: {rel_s:.6f}"

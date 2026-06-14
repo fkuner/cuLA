@@ -68,8 +68,127 @@ def la_state_update_kernel(
     ilp_rows: cutlass.Constexpr[int],
     use_packed_fma: cutlass.Constexpr[bool],
 ):
-    # KERNEL BODY FILLED IN TASK 3.
-    return
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size           # 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group   # 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp            # 4
+
+    lane_in_group = lane_id % threads_per_group
+    group_in_warp = lane_id // threads_per_group
+    group_idx = warp_idx * groups_per_warp + group_in_warp
+
+    block_idx, _, _ = cute.arch.block_idx()
+    i_v = block_idx % num_v_tiles
+    tmp = block_idx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+    L = accepted_len[i_n]
+
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_h = cute.make_rmem_tensor(
+        cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32
+    )
+
+    if cache_idx >= 0 and L > 0:
+        r_decay = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+        flat_state_idx = cache_idx * HV + i_hv
+
+        if cutlass.const_expr(ilp_rows == 2):
+            half_rows: cutlass.Constexpr[int] = rows_per_group // 2
+            for row_pair in cutlass.range_constexpr(half_rows):
+                v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_pair * 2
+                v_idx_b = v_idx_a + 1
+                if v_idx_b < V:
+                    h_tile_a = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_a, lane_in_group))
+                    h_tile_b = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_b, lane_in_group))
+                    cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                    cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+
+                    for i in cutlass.range(0, L, unroll=0):
+                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
+                        cute.autovec_copy(k_tile, r_k_bf16)
+                        for j in cutlass.range_constexpr(vec_size):
+                            r_k[j] = cutlass.Float32(r_k_bf16[j])
+                        r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
+                        r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
+                        for j in cutlass.range_constexpr(0, vec_size, 2):
+                            r_h[0, j], r_h[0, j + 1] = la_update_pair(
+                                r_h[0, j], r_h[0, j + 1], r_k[j], r_k[j + 1], r_v_a, r_decay, use_packed_fma)
+                            r_h[1, j], r_h[1, j + 1] = la_update_pair(
+                                r_h[1, j], r_h[1, j + 1], r_k[j], r_k[j + 1], r_v_b, r_decay, use_packed_fma)
+
+                    h_out_a = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_a, lane_in_group))
+                    cute.autovec_copy(cute.slice_(r_h, (0, None)), h_out_a)
+                    h_out_b = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_b, lane_in_group))
+                    cute.autovec_copy(cute.slice_(r_h, (1, None)), h_out_b)
+
+        elif cutlass.const_expr(ilp_rows == 4):
+            quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
+            for row_quad in cutlass.range_constexpr(quarter_rows):
+                v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_quad * 4
+                v_idx_b = v_idx_a + 1
+                v_idx_c = v_idx_a + 2
+                v_idx_d = v_idx_a + 3
+                if v_idx_d < V:
+                    for off, slot in ((0, 0), (1, 1), (2, 2), (3, 3)):
+                        h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_a + off, lane_in_group))
+                        cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
+
+                    for i in cutlass.range(0, L, unroll=0):
+                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
+                        cute.autovec_copy(k_tile, r_k_bf16)
+                        for j in cutlass.range_constexpr(vec_size):
+                            r_k[j] = cutlass.Float32(r_k_bf16[j])
+                        r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
+                        r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
+                        r_v_c = cutlass.Float32(v[i_n, i, i_hv, v_idx_c])
+                        r_v_d = cutlass.Float32(v[i_n, i, i_hv, v_idx_d])
+                        for j in cutlass.range_constexpr(0, vec_size, 2):
+                            r_h[0, j], r_h[0, j + 1] = la_update_pair(
+                                r_h[0, j], r_h[0, j + 1], r_k[j], r_k[j + 1], r_v_a, r_decay, use_packed_fma)
+                            r_h[1, j], r_h[1, j + 1] = la_update_pair(
+                                r_h[1, j], r_h[1, j + 1], r_k[j], r_k[j + 1], r_v_b, r_decay, use_packed_fma)
+                            r_h[2, j], r_h[2, j + 1] = la_update_pair(
+                                r_h[2, j], r_h[2, j + 1], r_k[j], r_k[j + 1], r_v_c, r_decay, use_packed_fma)
+                            r_h[3, j], r_h[3, j + 1] = la_update_pair(
+                                r_h[3, j], r_h[3, j + 1], r_k[j], r_k[j + 1], r_v_d, r_decay, use_packed_fma)
+
+                    for off, slot in ((0, 0), (1, 1), (2, 2), (3, 3)):
+                        h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_a + off, lane_in_group))
+                        cute.autovec_copy(cute.slice_(r_h, (slot, None)), h_out)
+
+        elif cutlass.const_expr(ilp_rows == 8):
+            eighth_rows: cutlass.Constexpr[int] = rows_per_group // 8
+            for row_oct in cutlass.range_constexpr(eighth_rows):
+                v_idx_0 = i_v * tile_v + group_idx * rows_per_group + row_oct * 8
+                if v_idx_0 + 7 < V:
+                    for slot in cutlass.range_constexpr(8):
+                        h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_0 + slot, lane_in_group))
+                        cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
+
+                    for i in cutlass.range(0, L, unroll=0):
+                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
+                        cute.autovec_copy(k_tile, r_k_bf16)
+                        for j in cutlass.range_constexpr(vec_size):
+                            r_k[j] = cutlass.Float32(r_k_bf16[j])
+                        for slot in cutlass.range_constexpr(8):
+                            r_v_s = cutlass.Float32(v[i_n, i, i_hv, v_idx_0 + slot])
+                            for j in cutlass.range_constexpr(0, vec_size, 2):
+                                r_h[slot, j], r_h[slot, j + 1] = la_update_pair(
+                                    r_h[slot, j], r_h[slot, j + 1], r_k[j], r_k[j + 1], r_v_s, r_decay, use_packed_fma)
+
+                    for slot in cutlass.range_constexpr(8):
+                        h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx_0 + slot, lane_in_group))
+                        cute.autovec_copy(cute.slice_(r_h, (slot, None)), h_out)
 
 
 @cute.jit

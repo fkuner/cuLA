@@ -9,7 +9,7 @@
 
 ## 1. Goal
 
-Make cuLA's Lightning-Attention (LA) KVBuffer kernels usable inside SGLang so that the per-request **memory saving** (no per-draft-token intermediate state cache) turns into **serving-level concurrency capacity** (paper Fig. 5: ~5× requests, ~1.46× throughput). The kernel-only speedup is small and not the point; the win is dropping the `intermediate_ssm` buffer.
+Make cuLA's Lightning-Attention (LA) KVBuffer kernels usable inside SGLang so that the per-request **memory saving** turns into **serving-level concurrency capacity** (paper Fig. 5: ~5× requests, ~1.46× throughput). The kernel-only speedup is small and not the point; the win is **replacing the large per-draft-token intermediate state cache (`intermediate_ssm`) with a small draft-KV buffer** — the paper's KVBuffer mechanism for the §3.3 parallel-verify scenario.
 
 ## 2. Core architectural decision: cuLA owns the whole LA layer
 
@@ -48,19 +48,28 @@ All in a SGLang fork / feature branch. Ordered by dependency.
 A backend class (new, or a branch inside `layers/attention/linear/lightning_backend.py`) selected when `hf_config.linear_backend == "cula"` (the selector already exists, `lightning_backend.py:78`, default `"seg_la"`). It implements:
 - `forward_extend` (prefill) → `lightning_attn_fwd_varlen(state_pool=temporal, initial_state_indices=mamba_cache_indices, cu_seqlens=query_start_loc, …)`.
 - `forward_decode` (single token) → `linear_attention_decode(s=temporal, s_offsets=mamba_cache_indices, …)`.
-- `forward_extend` under `is_target_verify()` → `linear_attention_verify_kvbuffer(s=temporal, h0_indices=mamba_cache_indices, …)`, **NOT** writing any intermediate cache.
+- `forward_extend` under `is_target_verify()` → `linear_attention_verify_kvbuffer(s=temporal, h0_indices=mamba_cache_indices, …)`, **NOT** writing any intermediate state cache. Additionally, the backend **copies the draft `k,v` into the slim KV buffer (§4.4)** so they survive to the commit step (a cheap bf16 copy; `k,v` are already the verify inputs).
+
+**Routing fact (verified):** for the Bailing target the model's `linear_backend` defaults to `"seg_la"` (`bailing_moe_linear.py:456`), and with that value **prefill, decode, AND verify all go through `seg_la_fwd`** (`lightning_backend.py:306`/`:373` → `_linear_attention_entry`). The Bailing-specific kernels (`jit_linear_forward_prefix`, `linear_decode_forward_triton`) are only used when `linear_backend == "minimax"` (`:295`/`:371`). So replacing the whole seg_la path with cuLA is a **clean wholesale swap of one uniform K-major Triton path** — there is no separate Bailing prefill to also patch. (Must-verify: confirm the deployed Bailing config is `seg_la`, not `minimax`.)
 
 ### 4.2 MambaPool V-major allocation branch
 `mem_cache/memory_pool.py` allocates `temporal` as `[HV, K, V]` (V-contiguous = K-major). Add a `linear_backend=="cula"` branch (alongside the existing NPU-only `transpose(-1,-2)` at ~`:376`) that allocates/transposes `temporal` to cuLA's **V-major `[HV, V, K]` (K-contiguous)**. Confirm `K == V == 128` for the target model so the slot is square. **This is the only structural SGLang memory change.**
 
 ### 4.3 Commit via cuLA state-update (replace the scatter)
 SGLang's current commit (`update_mamba_state_after_mtp_verify`, `hybrid_linear_attn_backend.py:873`) scatters `intermediate_ssm[last_correct_step] → temporal`. Replace, for the cula backend, with:
-1. Derive `accepted_len[b] ∈ [0, T]` from `last_correct_step_indices` (commit length = correct steps; the existing `spec_utils.py:593` already computes `last_correct_step_indices = accept_index[…, accept_lens-1] - offset`).
-2. Call `linear_attention_state_update_kvbuffer(k, v, temporal, decay_scales, h0_indices=mamba_cache_indices, accepted_len, T)`.
-This recomputes `h_L` from `(h_0, k, v)` instead of reading it from a cache.
+1. Derive `accepted_len[b] ∈ [0, T]` from `last_correct_step_indices` (commit length = correct steps; the existing `spec_utils.py:593` already computes `last_correct_step_indices = accept_index[…, accept_lens-1] - offset`; `accept_lens` is already in scope at the commit site, `spec_utils.py:558`).
+2. Read the draft `k,v` back **from the slim KV buffer (§4.4)** and call `linear_attention_state_update_kvbuffer(k, v, temporal, decay_scales, h0_indices=mamba_cache_indices, accepted_len, T)`.
+This recomputes `h_L` from `(h_0, accepted k, v)` instead of reading a per-step state cache.
 
-### 4.4 Drop the intermediate cache
-With verify no longer writing per-step states and commit recomputing `h_L`, the `SpeculativeState.intermediate_ssm` allocation (`memory_pool.py:384`, whose GB size is logged at `:423`) is **not allocated** for the cula backend. **This freed memory is the entire point** — it raises the MambaPool slot count → max concurrent requests.
+**Invariant:** verify is read-only on `temporal`, so between verify and commit the pool slot still holds `h_0`; the commit reads `h_0` + buffered `k,v`. SGLang must not advance `temporal` for these requests between the two steps.
+
+### 4.4 The slim KV buffer (the paper's KVBuffer, §3.3 special case) — replaces `intermediate_ssm`
+This is the **core mechanism**, not a side effect. Linear attention keeps no per-token KV cache (only the state), so the draft `k,v` are transient activations freed when the verify forward returns — but the commit (post-sampling, outside the forward) needs them. So we **persist the draft `k,v` in a buffer**: exactly the paper's KVBuffer for the verify scenario (paper Fig. 1 / §3.3).
+
+- **Shape:** fixed per-request `[slots, T, H, K]` (k) + `[slots, T, HV, V]` (v), bf16. **No paging** — `T = draft_token_num` is fixed and known, the buffer is written in verify and consumed in commit each cycle, so there is no dynamic growth or fragmentation to manage.
+- **Where:** `MambaPool.SpeculativeState`, **replacing** the `intermediate_ssm` allocation (`memory_pool.py:384`, GB logged at `:423`).
+- **Memory win (the entire point):** out goes `intermediate_ssm` = `slots·T·HV·V·K·4` (per-step fp32 states); in comes the KV buffer = `slots·T·H·K·2 + slots·T·HV·V·2` (bf16, no K·V product). Net saving is large → more MambaPool slots → ~5× concurrent requests (paper Fig. 5).
+- **Not built here:** the general **paged** KV buffer (§3.1) and the §3.2 chunkwise-decode / §3.4 KV-only scenarios that need it. Those unlock the separate ~45% *decode-latency* win but require new chunkwise-decode machinery; out of scope (see §7).
 
 ### 4.5 Tensor / convention adapters
 - **q/k/v layout:** mixer emits packed `[total_tokens, H, head_dim]`. Reshape to cuLA's expected `[1,T,H,D]` (prefill), `[B,1,H,K]` (decode), `[B,T,H,K]`/`[B,T,HV,V]` (verify). Valid because target-verify uses a uniform `draft_token_num` per request. Mixed prefill+decode batches must be split into per-mode sub-calls (cuLA has no single fused mixed-mode entry).
@@ -93,9 +102,21 @@ Speculative decoding is **output-preserving**: the oracle is "cula backend outpu
 
 ## 7. Scope
 
-**In scope:** the `linear_backend="cula"` LA backend (prefill+decode+verify+commit routing), the MambaPool V-major branch, the cuLA-commit/dropped-intermediate path, adapters, warmup, and the test layers above.
+**In scope (paper §3.3 only):** the `linear_backend="cula"` LA backend (prefill+decode+verify+commit routing as a wholesale replacement of the uniform seg_la path), the MambaPool V-major branch, the **slim fixed-T KV buffer** replacing `intermediate_ssm`, the cuLA-commit path, adapters, CUDA-graph warmup, and the test layers above. Target win: ~5× concurrent requests / ~1.46× throughput.
 
-**Out of scope:** GDN/delta-rule (the paper's Qwen3-Next variant); tree-structured (`topk>1`) speculative verify — cuLA assumes chain/MTP, consistent with seg_la's MTP path which is also chain-only; adding MTP-draft support to a model that lacks it (tracked as a blocking unknown, not built here); cuLA prefill GQA support.
+**Out of scope:**
+- **The general paged KV buffer (§3.1) and §3.2 chunkwise decode / §3.4 KV-only.** These need dynamic/paged buffering and new chunkwise-decode machinery, and deliver the *separate* ~45% decode-latency win — a follow-up, not this work. The slim buffer here is a clean special case that can later be generalized to paged when §3.2 has a real consumer.
+- GDN/delta-rule (the paper's Qwen3-Next variant).
+- Tree-structured (`topk>1`) speculative verify — cuLA assumes chain/MTP, consistent with seg_la's MTP path which is also chain-only.
+- cuLA prefill GQA support (target Bailing layers are MHA).
+
+## 7a. Three friction points (analyzed; all resolved/managed)
+1. **State layout / which kernels (resolved):** Bailing's whole LA path is uniform seg_la (K-major). cuLA replaces it wholesale with its V-major ops + a V-major pool → cuLA kernels untouched. No partial-splice K-major rework, no separate Bailing-prefill to patch.
+2. **`k,v` lifetime to commit (resolved = the KV buffer, §4.4):** draft `k,v` are freed after the verify forward; the slim KV buffer persists them to commit. This *is* the paper's KVBuffer mechanism, not a hazard.
+3. **CUDA-graph vs lazy compile (managed, §4.6):** warm up every captured `(B,T,pool)` shape before capture; add a capture→replay numerical-equivalence test to confirm cuLA's steady-state launch is graph-safe.
+
+## 7b. Paper-fidelity of cuLA's interface (no change needed)
+cuLA's `linear_attention_verify_kvbuffer` ↔ paper Eq. 7 (`O = Q·S_{t-j} + ((QK^T)⊙M)·V`) and `linear_attention_state_update_kvbuffer` ↔ paper Eq. 8 (`S_t = S_{t-j} + K_acc^T V_acc`): every equation variable maps to a parameter (`s`+`h0_indices`=`S_{t-j}`, `q,k,v`=draft KVs, `accepted_len`=`|accepted|`, `T`=`m`). Extra params (`softmax_scale`, `T`, `h0_indices`) are serving necessities the abstract matrix notation omits. `accepted_len` (vs paper's pre-sliced `K_acc`) is the correct *batched* form for per-request variable accept length. **No signature change for paper fidelity.** Two intentional impl divergences are §11-style perf follow-ups, not interface issues: cuLA's commit uses a recurrent loop vs Eq. 8's batched outer product; cuLA's verify uses per-pair `q·k` vs the chunkwise `QK^T` matmul.
 
 ## 8. Open risks / follow-ups (non-blocking)
 - cuLA prefill emits final-state only (no per-chunk intermediate `h`), so sub-sequence chunk-boundary prefix-cache tracking has no cuLA equivalent — fine for final-state-only models, revisit if a target needs unaligned-chunk tracking.

@@ -70,12 +70,16 @@ With verify no longer writing per-step states and commit recomputing `h_L`, the 
 ### 4.6 CUDA-graph warmup
 cuLA compiles kernels lazily (`@functools.cache` + `cute.compile`). SGLang captures CUDA graphs for **Decode** and **Target-Verify**, and compilation cannot run inside capture. **Before `init_cuda_graph_capture`, force a warmup call of every cula op at every captured shape** `(B, T, pool_size)` — and note `linear_attention_decode` branches on `B<=32` vs `B>32` (two kernels → two warmups). Varlen prefill is not graph-captured, so its lazy compile is fine.
 
-## 5. Must-verify before implementation (blocking unknowns)
+## 5. Validation target + must-verify before implementation
 
-1. **Which LA model exercises MTP?** `bailing_moe_linear` (MHA, uses `linear_backend`) and `minimax_m2` are the LA models, but the ready MTP draft models (`qwen3_next_mtp`, …) are GDN/Mamba, **not LA**. If no LA model has an MTP draft, the verify/commit (KVBuffer) path cannot be exercised end-to-end on a real model. Options: (a) confirm/add an MTP head to an LA model, or (b) validate verify/commit via the seg_la "spec + draft model" chain path (`seg_la_s_kernel`, topk=1) instead of MTP, or (c) operator-level equivalence test only (see §6, Layer 1). **Resolve this first — it gates the whole serving-level validation.**
+**Validation target (RESOLVED): `bailing_moe_linear` + `bailing_moe_nextn`.**
+`BailingMoELinearAttention` (`models/bailing_moe_linear.py:417`) routes its linear layers through the lightning/seg_la backend (`linear_backend` default `"seg_la"`, `:456`); the model is **hybrid** (`is_linear_layer(layer_idx, layer_group_size)`, `:129/:940` — some layers linear, some full attention). `bailing_moe_nextn.py` is its **NextN/MTP draft head** (DeepSeek-V3-style `eh_proj`/`enorm`/`hnorm`, `:86`). So the LA layers participate in MTP target-verify — exactly the seg_la `intermediate_ssm` caching path KVBuffer replaces. This is a complete in-tree LA+MTP speculative-decoding path; the KVBuffer verify/commit can be exercised end-to-end. (`minimax_m2` also has `num_mtp_modules` but does not route through seg_la as cleanly — secondary candidate.)
+
+**Must-verify before/early in implementation (not design blockers):**
+1. **Smoke-confirm the nextn+linear combo actually runs spec-decode** in this SGLang build (trace nextn worker → bailing linear layer → `lightning_backend` TARGET_VERIFY) — the pieces are all present; confirm end-to-end before relying on it.
 2. **`tp_slope` ↔ cuLA `decay_scales` sign/magnitude** — numeric equality check.
-3. **Target model `temporal` dtype is fp32** (cuLA state is fp32).
-4. **`minimax_m2` head config** (MHA vs GQA) if it's the chosen target — cuLA prefill is MHA-only.
+3. **Bailing `temporal` dtype is fp32** (cuLA state is fp32).
+4. **Bailing linear-layer head config is MHA** (`HV==H`) — cuLA prefill is MHA-only; confirmed `total_kv_heads == num_attention_heads` is expected for this model.
 
 ## 6. Test strategy (layered; all need an SM90+ GPU)
 
@@ -83,7 +87,7 @@ Speculative decoding is **output-preserving**: the oracle is "cula backend outpu
 
 - **Layer 0 — cuLA unit tests** (already exist): `pytest tests/test_la_verify_kvbuffer.py` — verify/state-update vs PyTorch reference.
 - **Layer 1 — operator equivalence in SGLang fork** (highest value, no model needed): same `(q,k,v,h0,accept_len)` → SGLang `seg_la_fwd(caches=…)` + scatter-commit vs cuLA `verify_kvbuffer` + `state_update_kvbuffer`; assert outputs and committed state match. This is also where the §4.5 convention adapters (layout/scale/decay/index) get validated.
-- **Layer 2 — single-model end-to-end**: an LA model with `linear_backend="cula"` vs `"seg_la"`, same prompt, greedy, assert identical tokens. Validates prefill+decode+verify+commit wiring + `mamba_cache_indices` + CUDA-graph warmup.
+- **Layer 2 — single-model end-to-end**: `bailing_moe_linear` (+ `bailing_moe_nextn` draft) with `linear_backend="cula"` vs `"seg_la"`, same prompt, greedy, assert identical tokens. Validates prefill+decode+verify+commit wiring + `mamba_cache_indices` + CUDA-graph warmup.
 - **Layer 3 — partial-accept correctness**: force `L<T`; assert tokens still equal non-spec-decode output (exercises `state_update`'s `L<T` path).
 - **Layer 4 — capacity/throughput** (the actual payoff): drop `intermediate_ssm`; at fixed HBM, measure max concurrent requests / tokens-per-sec, cula vs seg_la (`bench_serving` under memory pressure). The `intermediate_ssm` GB log at `memory_pool.py:423` quantifies the saving.
 

@@ -56,6 +56,8 @@ def la_state_update_kernel(
     v: cute.Tensor,             # [B, T, HV, V] bf16
     h0_indices: cute.Tensor,    # [B] int32
     accepted_len: cute.Tensor,  # [B] int32
+    k_buf: cute.Tensor,         # [pool_size, T, H, K] bf16 (READ when read_from_buf)
+    v_buf: cute.Tensor,         # [pool_size, T, HV, V] bf16 (READ when read_from_buf)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -67,6 +69,7 @@ def la_state_update_kernel(
     V: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
     use_packed_fma: cutlass.Constexpr[bool],
+    read_from_buf: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -114,12 +117,22 @@ def la_state_update_kernel(
                     cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
 
                     for i in cutlass.range(0, L, unroll=0):
-                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
+                        if cutlass.const_expr(read_from_buf):
+                            k_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size),
+                                                      (cache_idx, i, i_h, lane_in_group))
+                        else:
+                            k_tile = cute.local_tile(k, (1, 1, 1, vec_size),
+                                                      (i_n, i, i_h, lane_in_group))
                         cute.autovec_copy(k_tile, r_k_bf16)
                         for j in cutlass.range_constexpr(vec_size):
                             r_k[j] = cutlass.Float32(r_k_bf16[j])
-                        r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
-                        r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
+
+                        if cutlass.const_expr(read_from_buf):
+                            r_v_a = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_a])
+                            r_v_b = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_b])
+                        else:
+                            r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
+                            r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, j], r_h[0, j + 1] = la_update_pair(
                                 r_h[0, j], r_h[0, j + 1], r_k[j], r_k[j + 1], r_v_a, r_decay, use_packed_fma)
@@ -144,14 +157,25 @@ def la_state_update_kernel(
                         cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
 
                     for i in cutlass.range(0, L, unroll=0):
-                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
+                        if cutlass.const_expr(read_from_buf):
+                            k_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size),
+                                                      (cache_idx, i, i_h, lane_in_group))
+                        else:
+                            k_tile = cute.local_tile(k, (1, 1, 1, vec_size),
+                                                      (i_n, i, i_h, lane_in_group))
                         cute.autovec_copy(k_tile, r_k_bf16)
                         for j in cutlass.range_constexpr(vec_size):
                             r_k[j] = cutlass.Float32(r_k_bf16[j])
-                        r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
-                        r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
-                        r_v_c = cutlass.Float32(v[i_n, i, i_hv, v_idx_c])
-                        r_v_d = cutlass.Float32(v[i_n, i, i_hv, v_idx_d])
+                        if cutlass.const_expr(read_from_buf):
+                            r_v_a = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_a])
+                            r_v_b = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_b])
+                            r_v_c = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_c])
+                            r_v_d = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_d])
+                        else:
+                            r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
+                            r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
+                            r_v_c = cutlass.Float32(v[i_n, i, i_hv, v_idx_c])
+                            r_v_d = cutlass.Float32(v[i_n, i, i_hv, v_idx_d])
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, j], r_h[0, j + 1] = la_update_pair(
                                 r_h[0, j], r_h[0, j + 1], r_k[j], r_k[j + 1], r_v_a, r_decay, use_packed_fma)
@@ -176,12 +200,20 @@ def la_state_update_kernel(
                         cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
 
                     for i in cutlass.range(0, L, unroll=0):
-                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
+                        if cutlass.const_expr(read_from_buf):
+                            k_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size),
+                                                      (cache_idx, i, i_h, lane_in_group))
+                        else:
+                            k_tile = cute.local_tile(k, (1, 1, 1, vec_size),
+                                                      (i_n, i, i_h, lane_in_group))
                         cute.autovec_copy(k_tile, r_k_bf16)
                         for j in cutlass.range_constexpr(vec_size):
                             r_k[j] = cutlass.Float32(r_k_bf16[j])
                         for slot in cutlass.range_constexpr(8):
-                            r_v_s = cutlass.Float32(v[i_n, i, i_hv, v_idx_0 + slot])
+                            if cutlass.const_expr(read_from_buf):
+                                r_v_s = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_0 + slot])
+                            else:
+                                r_v_s = cutlass.Float32(v[i_n, i, i_hv, v_idx_0 + slot])
                             for j in cutlass.range_constexpr(0, vec_size, 2):
                                 r_h[slot, j], r_h[slot, j + 1] = la_update_pair(
                                     r_h[slot, j], r_h[slot, j + 1], r_k[j], r_k[j + 1], r_v_s, r_decay, use_packed_fma)
@@ -199,6 +231,8 @@ def run_la_state_update_kernel(
     v: cute.Tensor,
     h0_indices: cute.Tensor,
     accepted_len: cute.Tensor,
+    k_buf: cute.Tensor,
+    v_buf: cute.Tensor,
     B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
@@ -209,29 +243,17 @@ def run_la_state_update_kernel(
     vec_size: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
     use_packed_fma: cutlass.Constexpr[bool],
+    read_from_buf: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
     grid_size = B * HV * num_v_tiles
 
     la_state_update_kernel(
-        h0_source,
-        decay_scales,
-        k,
-        v,
-        h0_indices,
-        accepted_len,
-        vec_size,
-        num_v_tiles,
-        tile_v,
-        B,
-        T,
-        H,
-        HV,
-        K,
-        V,
-        ilp_rows,
-        use_packed_fma,
+        h0_source, decay_scales, k, v, h0_indices, accepted_len,
+        k_buf, v_buf,
+        vec_size, num_v_tiles, tile_v,
+        B, T, H, HV, K, V, ilp_rows, use_packed_fma, read_from_buf,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -243,43 +265,55 @@ def run_la_state_update_kernel(
 def _get_compiled_state_update_kernel(
     B: int, T: int, H: int, HV: int, K: int, V: int,
     pool_size: int, tile_v: int, vec_size: int, ilp_rows: int, use_packed_fma: bool,
+    read_from_buf: bool,
 ):
     return {}
 
 
 def linear_attention_state_update_kvbuffer(
-    k: torch.Tensor,            # [B, T, H,  K] bf16
-    v: torch.Tensor,            # [B, T, HV, V] bf16
+    k: torch.Tensor,            # [B, T, H,  K] bf16 — read when k_buf is None
+    v: torch.Tensor,            # [B, T, HV, V] bf16 — read when v_buf is None
     s: torch.Tensor,            # [pool_size, HV, V, K] fp32, WRITTEN IN PLACE
     decay_scales: torch.Tensor, # [H] fp32
     h0_indices: torch.Tensor,   # [B] int32, -1 to skip
     accepted_len: torch.Tensor, # [B] int32, in [0, T]
-    T: int,                     # = k.shape[1]
+    T: int,
+    k_buf: torch.Tensor | None = None,  # [pool_size, T, H, K] bf16
+    v_buf: torch.Tensor | None = None,  # [pool_size, T, HV, V] bf16
 ) -> None:
     """
     Advance pooled state from h_init to h_state_L per batch (KVBuffer Eq. 8).
 
-    For batch b: if h0_indices[b] < 0 OR accepted_len[b] == 0, the pool slot is
-    left unchanged. Otherwise s[h0_indices[b]] is overwritten with the state after
-    accepted_len[b] recurrent steps over (k, v).
+    When k_buf and v_buf are provided, reads k,v from pool-indexed buffers
+    instead of batch-indexed input tensors.
     """
     B, T_k, H, K = k.shape
     assert T_k == T, f"k.shape[1]={T_k} doesn't match T={T}"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
 
-    # disable_state_update is irrelevant here; pass False to get the same tiling
-    # the verify kernel uses for the h0 read alignment.
+    read_from_buf = k_buf is not None and v_buf is not None
+    if (k_buf is None) != (v_buf is None):
+        raise ValueError("k_buf and v_buf must both be None or both be provided")
+
     tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, False)
     major, _ = get_device_sm_version(k.device)
     use_packed_fma = major >= 10
 
     cache_key = (
         B, T, H, HV, K, V, pool_size, tile_v, vec_size, ilp_rows, use_packed_fma,
+        read_from_buf,
     )
     cache = _get_compiled_state_update_kernel(*cache_key)
 
     h0_view = s.view(pool_size * HV, V, K)
+
+    if not read_from_buf:
+        k_buf_t = torch.empty(1, 1, 1, 1, device=k.device, dtype=torch.bfloat16)
+        v_buf_t = torch.empty(1, 1, 1, 1, device=k.device, dtype=torch.bfloat16)
+    else:
+        k_buf_t = k_buf
+        v_buf_t = v_buf
 
     if "compiled" not in cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -291,11 +325,14 @@ def linear_attention_state_update_kvbuffer(
             from_dlpack(v, assumed_align=16),
             from_dlpack(h0_indices, assumed_align=16),
             from_dlpack(accepted_len, assumed_align=16),
+            from_dlpack(k_buf_t, assumed_align=16),
+            from_dlpack(v_buf_t, assumed_align=16),
             B=B, T=T, H=H, HV=HV, K=K, V=V,
             tile_v=tile_v,
             vec_size=vec_size,
             ilp_rows=ilp_rows,
             use_packed_fma=use_packed_fma,
+            read_from_buf=read_from_buf,
             stream=stream,
             options="--enable-tvm-ffi",
         )
@@ -309,5 +346,6 @@ def linear_attention_state_update_kvbuffer(
         k, v,
         h0_indices,
         accepted_len,
+        k_buf_t, v_buf_t,
         stream,
     )

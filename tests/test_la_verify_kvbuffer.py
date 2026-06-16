@@ -309,3 +309,162 @@ def test_end_to_end_equivalence_with_baseline():
     rel_s = torch.sqrt(torch.mean((s_kv - last_state) ** 2)).item() / (
         torch.abs(last_state).max().item() + 1e-8)
     assert rel_s < 1e-3, f"state mismatch vs baseline last intermediate: {rel_s:.6f}"
+
+
+@pytest.mark.parametrize("B,T", [(4, 4), (8, 2), (32, 4)])
+def test_verify_writes_kv_buffer(B, T):
+    """Verify kernel with k_buf/v_buf writes correct copies of k and v."""
+    _skip_if_no_sm90_or_later()
+    H, HV, D = 64, 64, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    pool_size = B
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    k_buf = torch.zeros(pool_size, T, H, D, device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
+
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+        k_buf=k_buf, v_buf=v_buf,
+    )
+
+    for b in range(B):
+        pool_idx = h0_indices[b].item()
+        assert torch.equal(k_buf[pool_idx], k[b]), f"k_buf mismatch at batch {b}"
+        assert torch.equal(v_buf[pool_idx], v[b]), f"v_buf mismatch at batch {b}"
+
+
+def test_verify_output_unchanged_with_kv_write():
+    """Output o is identical whether k_buf/v_buf are provided or not."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 8, 4, 64, 64, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    pool_size = B
+    s1 = state.permute(0, 1, 3, 2).contiguous().clone()
+    s2 = s1.clone()
+    out_no_buf = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    out_with_buf = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+
+    linear_attention_verify_kvbuffer(
+        q, k, v, s1, out_no_buf, decay_scales, h0_indices, scale, T,
+    )
+
+    k_buf = torch.zeros(pool_size, T, H, D, device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    linear_attention_verify_kvbuffer(
+        q, k, v, s2, out_with_buf, decay_scales, h0_indices, scale, T,
+        k_buf=k_buf, v_buf=v_buf,
+    )
+
+    assert torch.equal(out_no_buf, out_with_buf), "kv write should not affect output"
+
+
+@pytest.mark.parametrize("B,T,H,HV,D", [(4, 4, 16, 16, 128), (8, 4, 64, 64, 128)])
+def test_state_update_from_buffer(B, T, H, HV, D):
+    """State update from k_buf/v_buf matches state update from raw k,v."""
+    _skip_if_no_sm90_or_later()
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    _, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    pool_size = B
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    L_per_batch = torch.full((B,), T, device="cuda", dtype=torch.int32)
+
+    # Path A: read from raw k, v
+    s_raw = state.permute(0, 1, 3, 2).contiguous().clone()
+    linear_attention_state_update_kvbuffer(
+        k, v, s_raw, decay_scales, h0_indices, L_per_batch, T,
+    )
+
+    # Path B: read from buffer (fill buffer with same k, v)
+    k_buf = torch.zeros(pool_size, T, H, D, device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    for b in range(B):
+        k_buf[h0_indices[b].item()] = k[b]
+        v_buf[h0_indices[b].item()] = v[b]
+
+    s_buf = state.permute(0, 1, 3, 2).contiguous().clone()
+    linear_attention_state_update_kvbuffer(
+        k, v, s_buf, decay_scales, h0_indices, L_per_batch, T,
+        k_buf=k_buf, v_buf=v_buf,
+    )
+
+    assert torch.equal(s_raw, s_buf), "buffer-read state must match raw-read state"
+
+
+def test_verify_skip_negative_indices_no_buffer_write():
+    """h0_indices[b]=-1: k_buf and v_buf slots are untouched."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 4, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    pool_size = B
+    sentinel = 42.0
+    k_buf = torch.full((pool_size, T, H, D), sentinel, device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.full((pool_size, T, HV, D), sentinel, device="cuda", dtype=torch.bfloat16)
+    k_buf_snap = k_buf.clone()
+    v_buf_snap = v_buf.clone()
+
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+    h0_indices[2] = -1
+
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+        k_buf=k_buf, v_buf=v_buf,
+    )
+
+    assert torch.equal(k_buf[2], k_buf_snap[2]), "skipped batch k_buf slot was modified"
+    assert torch.equal(v_buf[2], v_buf_snap[2]), "skipped batch v_buf slot was modified"
+
+
+def test_end_to_end_with_buffer():
+    """Full pipeline: verify(+kv write) → state_update(from buffer) matches baseline."""
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 8, 4, 64, 64, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+    q, k, v, state = _make_inputs(B, T, H, HV, D)
+
+    pool_size = B
+    h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
+
+    # Reference: existing end-to-end (no buffer)
+    s_ref = state.permute(0, 1, 3, 2).contiguous().clone()
+    out_ref = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_ref, out_ref, decay_scales, h0_indices, scale, T,
+    )
+    accepted_len = torch.full((B,), T, device="cuda", dtype=torch.int32)
+    linear_attention_state_update_kvbuffer(
+        k, v, s_ref, decay_scales, h0_indices, accepted_len, T,
+    )
+
+    # Buffer path: verify writes buffer, state_update reads buffer
+    s_buf = state.permute(0, 1, 3, 2).contiguous().clone()
+    out_buf = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
+    k_buf = torch.zeros(pool_size, T, H, D, device="cuda", dtype=torch.bfloat16)
+    v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
+
+    linear_attention_verify_kvbuffer(
+        q, k, v, s_buf, out_buf, decay_scales, h0_indices, scale, T,
+        k_buf=k_buf, v_buf=v_buf,
+    )
+    linear_attention_state_update_kvbuffer(
+        k, v, s_buf, decay_scales, h0_indices, accepted_len, T,
+        k_buf=k_buf, v_buf=v_buf,
+    )
+
+    assert torch.equal(out_ref, out_buf), "output mismatch with buffer pipeline"
+    assert torch.equal(s_ref, s_buf), "state mismatch with buffer pipeline"

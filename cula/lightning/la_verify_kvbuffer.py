@@ -66,7 +66,6 @@ def la_verify_kvbuffer_kernel(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
-    use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     write_kv: cutlass.Constexpr[bool],
 ):
@@ -135,9 +134,11 @@ def la_verify_kvbuffer_kernel(
                     cute.autovec_copy(r_k_bf16, kb_tile)
 
         # Phase 1: cooperative QK matrix — 4 warps split T*(T+1)/2 qk dot products.
-        # Warp w handles rows where t % 4 == w. Result written to SMEM.
+        # Warp w handles rows where min(t, T-1-t) % 4 == w (head-tail pairing) so that
+        # each warp's total row-length is balanced: heavy tail rows are paired with light
+        # head rows, making per-warp work ≈ T*(T+1)/8 regardless of T.
         for t_assign in cutlass.range_constexpr(T):
-            if t_assign % 4 == warp_idx:
+            if min(t_assign, T - 1 - t_assign) % 4 == warp_idx:
                 for i in cutlass.range_constexpr(t_assign + 1):
                     qk_lo = cutlass.Float32(0.0)
                     qk_hi = cutlass.Float32(0.0)
@@ -165,14 +166,20 @@ def la_verify_kvbuffer_kernel(
                     cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
 
                 # Load all T v-values for these rows.
+                # v has no K dimension, so all 32 lanes in a group index the same address.
+                # Only lane 0 reads from global memory; the value is then broadcast to all
+                # lanes via butterfly shuffle (lane 0 starts with val, others with 0.0;
+                # the additive XOR cascade propagates val to every lane in 5 steps).
                 for t in cutlass.range_constexpr(T):
                     for slot in cutlass.range_constexpr(ilp_rows):
-                        r_v_seq[t, slot] = cutlass.Float32(v[i_n, t, i_hv, v_base + slot])
-
-                        # Write v to buffer — each (cache_idx, t, hv, v_row) written once
-                        if cutlass.const_expr(write_kv):
-                            if lane_in_group == 0:
+                        val = cutlass.Float32(0.0)
+                        if lane_in_group == 0:
+                            val = cutlass.Float32(v[i_n, t, i_hv, v_base + slot])
+                            if cutlass.const_expr(write_kv):
                                 v_buf[(cache_idx, t, i_hv, v_base + slot)] = v[i_n, t, i_hv, v_base + slot]
+                        for offset in [16, 8, 4, 2, 1]:
+                            val = val + cute.arch.shuffle_sync_bfly(val, offset=offset, mask=-1, mask_and_clamp=31)
+                        r_v_seq[t, slot] = val
 
                 for t in cutlass.range_constexpr(T):
                     # term1: alpha^{t+1} * (h_init @ q_t)  (per-slot warp reduce)
@@ -222,7 +229,6 @@ def run_la_verify_kvbuffer_kernel(
     tile_v: cutlass.Constexpr[int],
     vec_size: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
-    use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     write_kv: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
@@ -230,10 +236,7 @@ def run_la_verify_kvbuffer_kernel(
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
     grid_size = B * HV * num_v_tiles
 
-    # SMEM: s_qk_scaled[T][T] + optional staged v/output.
-    smem_bytes = T * T * 4  # s_qk_scaled
-    if cutlass.const_expr(use_smem_v):
-        smem_bytes = smem_bytes + T * tile_v * 4 + T * tile_v * 2
+    smem_bytes = T * T * 4  # s_qk_scaled[T][T]
 
     la_verify_kvbuffer_kernel(
         h0_source,
@@ -256,7 +259,6 @@ def run_la_verify_kvbuffer_kernel(
         K,
         V,
         ilp_rows,
-        use_smem_v,
         use_packed_fma,
         write_kv,
     ).launch(
@@ -271,7 +273,7 @@ def run_la_verify_kvbuffer_kernel(
 def _get_compiled_verify_kvbuffer_kernel(
     B: int, T: int, H: int, HV: int, K: int, V: int,
     pool_size: int, softmax_scale: float,
-    tile_v: int, vec_size: int, ilp_rows: int, use_smem_v: bool, use_packed_fma: bool,
+    tile_v: int, vec_size: int, ilp_rows: int, use_packed_fma: bool,
     write_kv: bool,
 ):
     return {}
@@ -308,13 +310,13 @@ def linear_attention_verify_kvbuffer(
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
-    tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, True)
+    tile_v, vec_size, ilp_rows, _ = get_mtp_config(B, T, HV, V, True)
     major, _ = get_device_sm_version(q.device)
     use_packed_fma = major >= 10
 
     cache_key = (
         B, T, H, HV, K, V, pool_size, softmax_scale,
-        tile_v, vec_size, ilp_rows, use_smem_v, use_packed_fma,
+        tile_v, vec_size, ilp_rows, use_packed_fma,
         write_kv,
     )
     cache = _get_compiled_verify_kvbuffer_kernel(*cache_key)
@@ -347,7 +349,6 @@ def linear_attention_verify_kvbuffer(
             tile_v=tile_v,
             vec_size=vec_size,
             ilp_rows=ilp_rows,
-            use_smem_v=use_smem_v,
             use_packed_fma=use_packed_fma,
             write_kv=write_kv,
             stream=stream,

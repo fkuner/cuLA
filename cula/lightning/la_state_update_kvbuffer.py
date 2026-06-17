@@ -100,10 +100,32 @@ def la_state_update_kernel(
         cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32
     )
 
+    smem = cutlass.utils.SmemAllocator()
+    # v staged to SMEM once per block. v has no K dim, so the 32 lanes of a group
+    # all read the same scalar — staging turns 32 redundant per-lane global loads
+    # per step into one cooperative load + a warp-uniform SMEM read (broadcast).
+    sV = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
+    )
+
     if cache_idx >= 0 and L > 0:
         r_decay = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv
+
+        # Cooperative v load: the first tile_v threads each stage one v-row for all
+        # T steps into SMEM. cache_idx / L are block-uniform (derived from i_n), so
+        # the barrier below is safe — every thread takes this branch together.
+        v_tile_start = i_v * tile_v
+        for i in cutlass.range_constexpr(T):
+            if tidx < tile_v:
+                v_col = v_tile_start + tidx
+                if v_col < V:
+                    if cutlass.const_expr(read_from_buf):
+                        sV[(i, tidx)] = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_col])
+                    else:
+                        sV[(i, tidx)] = cutlass.Float32(v[i_n, i, i_hv, v_col])
+        cute.arch.barrier()
 
         if cutlass.const_expr(ilp_rows == 2):
             half_rows: cutlass.Constexpr[int] = rows_per_group // 2
@@ -127,12 +149,8 @@ def la_state_update_kernel(
                         for j in cutlass.range_constexpr(vec_size):
                             r_k[j] = cutlass.Float32(r_k_bf16[j])
 
-                        if cutlass.const_expr(read_from_buf):
-                            r_v_a = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_a])
-                            r_v_b = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_b])
-                        else:
-                            r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
-                            r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
+                        r_v_a = sV[(i, v_idx_a - v_tile_start)]
+                        r_v_b = sV[(i, v_idx_b - v_tile_start)]
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, j], r_h[0, j + 1] = la_update_pair(
                                 r_h[0, j], r_h[0, j + 1], r_k[j], r_k[j + 1], r_v_a, r_decay, use_packed_fma)
@@ -166,16 +184,10 @@ def la_state_update_kernel(
                         cute.autovec_copy(k_tile, r_k_bf16)
                         for j in cutlass.range_constexpr(vec_size):
                             r_k[j] = cutlass.Float32(r_k_bf16[j])
-                        if cutlass.const_expr(read_from_buf):
-                            r_v_a = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_a])
-                            r_v_b = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_b])
-                            r_v_c = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_c])
-                            r_v_d = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_d])
-                        else:
-                            r_v_a = cutlass.Float32(v[i_n, i, i_hv, v_idx_a])
-                            r_v_b = cutlass.Float32(v[i_n, i, i_hv, v_idx_b])
-                            r_v_c = cutlass.Float32(v[i_n, i, i_hv, v_idx_c])
-                            r_v_d = cutlass.Float32(v[i_n, i, i_hv, v_idx_d])
+                        r_v_a = sV[(i, v_idx_a - v_tile_start)]
+                        r_v_b = sV[(i, v_idx_b - v_tile_start)]
+                        r_v_c = sV[(i, v_idx_c - v_tile_start)]
+                        r_v_d = sV[(i, v_idx_d - v_tile_start)]
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, j], r_h[0, j + 1] = la_update_pair(
                                 r_h[0, j], r_h[0, j + 1], r_k[j], r_k[j + 1], r_v_a, r_decay, use_packed_fma)
@@ -210,10 +222,7 @@ def la_state_update_kernel(
                         for j in cutlass.range_constexpr(vec_size):
                             r_k[j] = cutlass.Float32(r_k_bf16[j])
                         for slot in cutlass.range_constexpr(8):
-                            if cutlass.const_expr(read_from_buf):
-                                r_v_s = cutlass.Float32(v_buf[cache_idx, i, i_hv, v_idx_0 + slot])
-                            else:
-                                r_v_s = cutlass.Float32(v[i_n, i, i_hv, v_idx_0 + slot])
+                            r_v_s = sV[(i, v_idx_0 + slot - v_tile_start)]
                             for j in cutlass.range_constexpr(0, vec_size, 2):
                                 r_h[slot, j], r_h[slot, j + 1] = la_update_pair(
                                     r_h[slot, j], r_h[slot, j + 1], r_k[j], r_k[j + 1], r_v_s, r_decay, use_packed_fma)
@@ -249,6 +258,8 @@ def run_la_state_update_kernel(
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
     grid_size = B * HV * num_v_tiles
 
+    smem_bytes = T * tile_v * 4  # sV[T][tile_v] fp32
+
     la_state_update_kernel(
         h0_source, decay_scales, k, v, h0_indices, accepted_len,
         k_buf, v_buf,
@@ -257,6 +268,7 @@ def run_la_state_update_kernel(
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
+        smem=smem_bytes,
         stream=stream,
     )
 

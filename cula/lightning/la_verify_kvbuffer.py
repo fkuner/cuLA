@@ -96,13 +96,18 @@ def la_verify_kvbuffer_kernel(
     r_q_seq = cute.make_rmem_tensor(cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_k_seq = cute.make_rmem_tensor(cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
-    r_v_seq = cute.make_rmem_tensor(cute.make_layout((T, 8), stride=(8, 1)), cutlass.Float32)
     r_decay_pow = cute.make_rmem_tensor(cute.make_layout((T + 1,), stride=(1,)), cutlass.Float32)
     o_partial = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
 
     smem = cutlass.utils.SmemAllocator()
     s_qk_scaled = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16
+    )
+    # v staged to SMEM (block-shared over the whole v-tile). v has no K dim, so
+    # keeping it in per-lane registers wasted 8*T regs/thread and capped occupancy;
+    # SMEM costs only T*tile_v*4 bytes and is read warp-uniformly (broadcast).
+    sVdata = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
     )
 
     if cache_idx >= 0:
@@ -153,33 +158,32 @@ def la_verify_kvbuffer_kernel(
                     if lane_in_group == 0:
                         s_qk_scaled[(t_assign, i)] = r_decay_pow[t_assign - i] * qk
 
+        # Cooperative v load: first tile_v threads each stage one v-row for all T
+        # steps into SMEM. v_buf write (when enabled) is fused here — every
+        # (cache_idx, t, hv, v_row) is written exactly once by its owning thread,
+        # replacing the old single-lane scalar store.
+        v_tile_start = i_v * tile_v
+        for t in cutlass.range_constexpr(T):
+            if tidx < tile_v:
+                v_global_idx = v_tile_start + tidx
+                if v_global_idx < V:
+                    vv = v[i_n, t, i_hv, v_global_idx]
+                    sVdata[(t, tidx)] = cutlass.Float32(vv)
+                    if cutlass.const_expr(write_kv):
+                        v_buf[(cache_idx, t, i_hv, v_global_idx)] = vv
+
         cute.arch.barrier()
 
         num_row_blocks: cutlass.Constexpr[int] = rows_per_group // ilp_rows
         for row_block in cutlass.range_constexpr(num_row_blocks):
             v_base = i_v * tile_v + group_idx * rows_per_group + row_block * ilp_rows
+            v_local = group_idx * rows_per_group + row_block * ilp_rows  # offset within sVdata's v-tile
             if v_base + (ilp_rows - 1) < V:
                 # Load h_init rows (persistent across the T loop).
                 for slot in cutlass.range_constexpr(ilp_rows):
                     h_tile = cute.local_tile(
                         h0_source, (1, 1, vec_size), (flat_state_idx, v_base + slot, lane_in_group))
                     cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
-
-                # Load all T v-values for these rows.
-                # v has no K dimension, so all 32 lanes in a group index the same address.
-                # Only lane 0 reads from global memory; the value is then broadcast to all
-                # lanes via butterfly shuffle (lane 0 starts with val, others with 0.0;
-                # the additive XOR cascade propagates val to every lane in 5 steps).
-                for t in cutlass.range_constexpr(T):
-                    for slot in cutlass.range_constexpr(ilp_rows):
-                        val = cutlass.Float32(0.0)
-                        if lane_in_group == 0:
-                            val = cutlass.Float32(v[i_n, t, i_hv, v_base + slot])
-                            if cutlass.const_expr(write_kv):
-                                v_buf[(cache_idx, t, i_hv, v_base + slot)] = v[i_n, t, i_hv, v_base + slot]
-                        for offset in [16, 8, 4, 2, 1]:
-                            val = val + cute.arch.shuffle_sync_bfly(val, offset=offset, mask=-1, mask_and_clamp=31)
-                        r_v_seq[t, slot] = val
 
                 for t in cutlass.range_constexpr(T):
                     # term1: alpha^{t+1} * (h_init @ q_t)  (per-slot warp reduce)
@@ -196,11 +200,11 @@ def la_verify_kvbuffer_kernel(
                             hq += cute.arch.shuffle_sync_bfly(hq, offset=offset, mask=-1, mask_and_clamp=31)
                         o_partial[slot] = r_decay_pow[t + 1] * hq
 
-                    # term2: read pre-computed decay-scaled qk from SMEM
+                    # term2: read pre-computed decay-scaled qk + staged v from SMEM
                     for i in cutlass.range_constexpr(t + 1):
                         coeff = s_qk_scaled[(t, i)]
                         for slot in cutlass.range_constexpr(ilp_rows):
-                            o_partial[slot] = o_partial[slot] + coeff * r_v_seq[i, slot]
+                            o_partial[slot] = o_partial[slot] + coeff * sVdata[(i, v_local + slot)]
 
                     # writeback (all lanes hold the reduced value; lane 0 writes)
                     if lane_in_group == 0:
@@ -236,7 +240,7 @@ def run_la_verify_kvbuffer_kernel(
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
     grid_size = B * HV * num_v_tiles
 
-    smem_bytes = T * T * 4  # s_qk_scaled[T][T]
+    smem_bytes = T * T * 4 + T * tile_v * 4  # s_qk_scaled[T][T] + sVdata[T][tile_v]
 
     la_verify_kvbuffer_kernel(
         h0_source,

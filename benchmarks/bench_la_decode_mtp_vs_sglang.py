@@ -368,10 +368,10 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
         k_buf=k_buf_bench, v_buf=v_buf_bench,
     )
 
-    tile_v_kv, vec_size_kv, ilp_rows_kv, use_smem_v_kv = get_mtp_config(B, T, HV, V, True)
+    tile_v_kv, vec_size_kv, ilp_rows_kv, _ = get_mtp_config(B, T, HV, V, True)
     verify_buf_cache_key = (
         B, T, H, HV, K, V, pool_size, scale,
-        tile_v_kv, vec_size_kv, ilp_rows_kv, use_smem_v_kv, use_packed_fma,
+        tile_v_kv, vec_size_kv, ilp_rows_kv, use_packed_fma,
         True,  # write_kv
     )
     verify_buf_cache = _get_compiled_verify_kvbuffer_kernel(*verify_buf_cache_key)

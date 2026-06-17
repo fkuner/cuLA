@@ -93,8 +93,6 @@ def la_verify_kvbuffer_kernel(
 
     r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    r_q_seq = cute.make_rmem_tensor(cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32)
-    r_k_seq = cute.make_rmem_tensor(cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_decay_pow = cute.make_rmem_tensor(cute.make_layout((T + 1,), stride=(1,)), cutlass.Float32)
     o_partial = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
@@ -109,6 +107,19 @@ def la_verify_kvbuffer_kernel(
     sVdata = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
     )
+    # q (scaled) and k staged to SMEM. They depend only on lane_in_group (NOT on
+    # warp/group), so a single copy of 32 K-slices is shared by all 4 warps —
+    # this also removes the redundant per-warp q/k loads. Lane-minor layout
+    # (T, vec_size, 32) keeps the 32 lanes of a warp on consecutive banks
+    # (conflict-free); cost is 2 * T*vec_size*32*4 bytes (~8KB at T=8).
+    s_q = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, vec_size, threads_per_group),
+                                          stride=(vec_size * threads_per_group, threads_per_group, 1)), 16
+    )
+    s_k = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((T, vec_size, threads_per_group),
+                                          stride=(vec_size * threads_per_group, threads_per_group, 1)), 16
+    )
 
     if cache_idx >= 0:
         alpha = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
@@ -121,22 +132,40 @@ def la_verify_kvbuffer_kernel(
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv
 
-        # Stage all T q (scaled) and k (fp32) for this lane's K-slice.
-        for t in cutlass.range_constexpr(T):
-            q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t, i_h, lane_in_group))
-            k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t, i_h, lane_in_group))
-            cute.autovec_copy(q_tile, r_q_bf16)
-            cute.autovec_copy(k_tile, r_k_bf16)
-            for j in cutlass.range_constexpr(vec_size):
-                r_q_seq[t, j] = cutlass.Float32(r_q_bf16[j]) * scale
-                r_k_seq[t, j] = cutlass.Float32(r_k_bf16[j])
+        # Stage all T q (scaled) and k (fp32) into SMEM. q/k are warp-independent,
+        # so only warp 0 (its 32 lanes cover the full K dim) loads them once.
+        # The k_buf write is fused here, replacing the old per-warp redundant store.
+        if warp_idx == 0:
+            for t in cutlass.range_constexpr(T):
+                q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t, i_h, lane_id))
+                k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t, i_h, lane_id))
+                cute.autovec_copy(q_tile, r_q_bf16)
+                cute.autovec_copy(k_tile, r_k_bf16)
+                for j in cutlass.range_constexpr(vec_size):
+                    s_q[(t, j, lane_id)] = cutlass.Float32(r_q_bf16[j]) * scale
+                    s_k[(t, j, lane_id)] = cutlass.Float32(r_k_bf16[j])
 
-            # Write k to buffer — gated: only one block per (b, h, t) writes
-            if cutlass.const_expr(write_kv):
-                if i_v == 0 and i_hv % (HV // H) == 0:
-                    kb_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size),
-                                              (cache_idx, t, i_h, lane_in_group))
-                    cute.autovec_copy(r_k_bf16, kb_tile)
+                # Write k to buffer — gated: only one block per (b, h, t) writes
+                if cutlass.const_expr(write_kv):
+                    if i_v == 0 and i_hv % (HV // H) == 0:
+                        kb_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size),
+                                                  (cache_idx, t, i_h, lane_id))
+                        cute.autovec_copy(r_k_bf16, kb_tile)
+
+        # Cooperative v load: first tile_v threads each stage one v-row for all T
+        # steps into SMEM. v_buf write (when enabled) is fused here — every
+        # (cache_idx, t, hv, v_row) is written exactly once by its owning thread.
+        v_tile_start = i_v * tile_v
+        for t in cutlass.range_constexpr(T):
+            if tidx < tile_v:
+                v_global_idx = v_tile_start + tidx
+                if v_global_idx < V:
+                    vv = v[i_n, t, i_hv, v_global_idx]
+                    sVdata[(t, tidx)] = cutlass.Float32(vv)
+                    if cutlass.const_expr(write_kv):
+                        v_buf[(cache_idx, t, i_hv, v_global_idx)] = vv
+
+        cute.arch.barrier()  # q/k/v staged → visible to all warps
 
         # Phase 1: cooperative QK matrix — 4 warps split T*(T+1)/2 qk dot products.
         # Warp w handles rows where min(t, T-1-t) % 4 == w (head-tail pairing) so that
@@ -149,8 +178,8 @@ def la_verify_kvbuffer_kernel(
                     qk_hi = cutlass.Float32(0.0)
                     for j in cutlass.range_constexpr(0, vec_size, 2):
                         qk_lo, qk_hi = hq_dot_pair(
-                            r_q_seq[t_assign, j], r_q_seq[t_assign, j + 1],
-                            r_k_seq[i, j], r_k_seq[i, j + 1],
+                            s_q[t_assign, j, lane_in_group], s_q[t_assign, j + 1, lane_in_group],
+                            s_k[i, j, lane_in_group], s_k[i, j + 1, lane_in_group],
                             qk_lo, qk_hi, use_packed_fma)
                     qk = qk_lo + qk_hi
                     for offset in [16, 8, 4, 2, 1]:
@@ -158,21 +187,7 @@ def la_verify_kvbuffer_kernel(
                     if lane_in_group == 0:
                         s_qk_scaled[(t_assign, i)] = r_decay_pow[t_assign - i] * qk
 
-        # Cooperative v load: first tile_v threads each stage one v-row for all T
-        # steps into SMEM. v_buf write (when enabled) is fused here — every
-        # (cache_idx, t, hv, v_row) is written exactly once by its owning thread,
-        # replacing the old single-lane scalar store.
-        v_tile_start = i_v * tile_v
-        for t in cutlass.range_constexpr(T):
-            if tidx < tile_v:
-                v_global_idx = v_tile_start + tidx
-                if v_global_idx < V:
-                    vv = v[i_n, t, i_hv, v_global_idx]
-                    sVdata[(t, tidx)] = cutlass.Float32(vv)
-                    if cutlass.const_expr(write_kv):
-                        v_buf[(cache_idx, t, i_hv, v_global_idx)] = vv
-
-        cute.arch.barrier()
+        cute.arch.barrier()  # s_qk_scaled written by Phase 1 → read by Phase 2
 
         num_row_blocks: cutlass.Constexpr[int] = rows_per_group // ilp_rows
         for row_block in cutlass.range_constexpr(num_row_blocks):
@@ -193,7 +208,7 @@ def la_verify_kvbuffer_kernel(
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             hq_lo, hq_hi = hq_dot_pair(
                                 r_h[slot, j], r_h[slot, j + 1],
-                                r_q_seq[t, j], r_q_seq[t, j + 1],
+                                s_q[t, j, lane_in_group], s_q[t, j + 1, lane_in_group],
                                 hq_lo, hq_hi, use_packed_fma)
                         hq = hq_lo + hq_hi
                         for offset in [16, 8, 4, 2, 1]:
@@ -240,7 +255,9 @@ def run_la_verify_kvbuffer_kernel(
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
     grid_size = B * HV * num_v_tiles
 
-    smem_bytes = T * T * 4 + T * tile_v * 4  # s_qk_scaled[T][T] + sVdata[T][tile_v]
+    # s_qk_scaled[T][T] + sVdata[T][tile_v] + s_q/s_k[T][vec_size][32]
+    threads_per_group = 32
+    smem_bytes = T * T * 4 + T * tile_v * 4 + 2 * T * vec_size * threads_per_group * 4
 
     la_verify_kvbuffer_kernel(
         h0_source,

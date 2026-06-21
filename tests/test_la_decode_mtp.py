@@ -45,8 +45,7 @@ from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
 # Pure PyTorch reference for multi-token Lightning Attention decode
 # ---------------------------------------------------------------------------
 def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_states=False, disable_state_update=False):
-    """
-    Pure PyTorch reference.
+    """Pure PyTorch reference.
 
     Args:
         q, k:        [B, T, H,  D] bf16
@@ -56,7 +55,7 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
         scale: float
         T: int
         cache_intermediate_states: cache per-step state to inter
-        disable_state_update: do not update state_new at end (return state.clone())
+        disable_state_update: do not update state_new at end
 
     Returns:
         out:        [B, T, HV, D] bf16
@@ -67,7 +66,7 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
     HV = v.shape[2]
     q_f = q.float() * scale
     k_f, v_f = k.float(), v.float()
-    decay_per_q_head = torch.exp(-decay_scales)  # [H]
+    decay_per_q_head = torch.exp(-decay_scales)
     decay_per_hv = decay_per_q_head.repeat_interleave(HV // H).view(1, HV, 1, 1)
 
     state_running = state.clone()
@@ -75,13 +74,11 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
     inter = torch.zeros(B * T * HV, D, D, dtype=torch.float32, device=q.device) if cache_intermediate_states else None
 
     for t in range(T):
-        q_hv = q_f[:, t].repeat_interleave(HV // H, dim=1)  # [B, HV, D]
-        k_hv = k_f[:, t].repeat_interleave(HV // H, dim=1)  # [B, HV, D]
-        v_t = v_f[:, t]  # [B, HV, D]
-
+        q_hv = q_f[:, t].repeat_interleave(HV // H, dim=1)
+        k_hv = k_f[:, t].repeat_interleave(HV // H, dim=1)
+        v_t = v_f[:, t]
         state_running = state_running * decay_per_hv + k_hv.unsqueeze(-1) * v_t.unsqueeze(-2)
         out[:, t] = torch.einsum("bhk,bhkv->bhv", q_hv, state_running).bfloat16()
-
         if cache_intermediate_states:
             for b in range(B):
                 inter[b * T * HV + t * HV : b * T * HV + (t + 1) * HV] = state_running[b]

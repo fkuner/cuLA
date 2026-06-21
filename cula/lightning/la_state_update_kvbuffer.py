@@ -40,24 +40,24 @@ import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from cula.utils import USE_FAST_MATH, get_device_sm_version
 from cula.lightning.la_decode_mtp import (
     NUM_THREADS_MTP,
     get_mtp_config,
     la_update_pair,
 )
+from cula.utils import USE_FAST_MATH, get_device_sm_version
 
 
 @cute.kernel
 def la_state_update_kernel(
-    h0_source: cute.Tensor,     # [pool_size * HV, V, K] fp32 (read + written in place)
+    h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32 (read + written in place)
     decay_scales: cute.Tensor,  # [H] fp32
-    k: cute.Tensor,             # [B, T, H,  K] bf16
-    v: cute.Tensor,             # [B, T, HV, V] bf16
-    h0_indices: cute.Tensor,    # [B] int32
+    k: cute.Tensor,  # [B, T, H,  K] bf16
+    v: cute.Tensor,  # [B, T, HV, V] bf16
+    h0_indices: cute.Tensor,  # [B] int32
     accepted_len: cute.Tensor,  # [B] int32
-    k_buf: cute.Tensor,         # [pool_size, T, H, K] bf16 (READ when read_from_buf)
-    v_buf: cute.Tensor,         # [pool_size, T, HV, V] bf16 (READ when read_from_buf)
+    k_buf: cute.Tensor,  # [pool_size, T, H, K] bf16 (READ when read_from_buf)
+    v_buf: cute.Tensor,  # [pool_size, T, HV, V] bf16 (READ when read_from_buf)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -76,9 +76,9 @@ def la_state_update_kernel(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-    threads_per_group: cutlass.Constexpr[int] = K // vec_size           # 32
-    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group   # 1
-    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp            # 4
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 4
 
     lane_in_group = lane_id % threads_per_group
     group_in_warp = lane_id // threads_per_group
@@ -96,9 +96,7 @@ def la_state_update_kernel(
 
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    r_h = cute.make_rmem_tensor(
-        cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32
-    )
+    r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
 
     if cache_idx >= 0 and L > 0:
         r_decay = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
@@ -121,11 +119,9 @@ def la_state_update_kernel(
                 # Recurrence: h = decay * h + k_i (x) v_i, for i in 0..L-1.
                 for i in cutlass.range(0, L, unroll=0):
                     if cutlass.const_expr(read_from_buf):
-                        k_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size),
-                                                  (cache_idx, i, i_h, lane_in_group))
+                        k_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size), (cache_idx, i, i_h, lane_in_group))
                     else:
-                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size),
-                                                  (i_n, i, i_h, lane_in_group))
+                        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i, i_h, lane_in_group))
                     cute.autovec_copy(k_tile, r_k_bf16)
                     for j in cutlass.range_constexpr(vec_size):
                         r_k[j] = cutlass.Float32(r_k_bf16[j])
@@ -136,7 +132,8 @@ def la_state_update_kernel(
                             r_v_s = cutlass.Float32(v[i_n, i, i_hv, v_idx_0 + slot])
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[slot, j], r_h[slot, j + 1] = la_update_pair(
-                                r_h[slot, j], r_h[slot, j + 1], r_k[j], r_k[j + 1], r_v_s, r_decay, use_packed_fma)
+                                r_h[slot, j], r_h[slot, j + 1], r_k[j], r_k[j + 1], r_v_s, r_decay, use_packed_fma
+                            )
 
                 # Write the advanced state back in place.
                 for slot in cutlass.range_constexpr(ilp_rows):
@@ -171,10 +168,26 @@ def run_la_state_update_kernel(
     grid_size = B * HV * num_v_tiles
 
     la_state_update_kernel(
-        h0_source, decay_scales, k, v, h0_indices, accepted_len,
-        k_buf, v_buf,
-        vec_size, num_v_tiles, tile_v,
-        B, T, H, HV, K, V, ilp_rows, use_packed_fma, read_from_buf,
+        h0_source,
+        decay_scales,
+        k,
+        v,
+        h0_indices,
+        accepted_len,
+        k_buf,
+        v_buf,
+        vec_size,
+        num_v_tiles,
+        tile_v,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        ilp_rows,
+        use_packed_fma,
+        read_from_buf,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS_MTP, 1, 1],
@@ -184,20 +197,29 @@ def run_la_state_update_kernel(
 
 @functools.cache
 def _get_compiled_state_update_kernel(
-    B: int, T: int, H: int, HV: int, K: int, V: int,
-    pool_size: int, tile_v: int, vec_size: int, ilp_rows: int, use_packed_fma: bool,
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    tile_v: int,
+    vec_size: int,
+    ilp_rows: int,
+    use_packed_fma: bool,
     read_from_buf: bool,
 ):
     return {}
 
 
 def linear_attention_state_update_kvbuffer(
-    k: torch.Tensor,            # [B, T, H,  K] bf16 — read when k_buf is None
-    v: torch.Tensor,            # [B, T, HV, V] bf16 — read when v_buf is None
-    s: torch.Tensor,            # [pool_size, HV, V, K] fp32, WRITTEN IN PLACE
-    decay_scales: torch.Tensor, # [H] fp32
-    h0_indices: torch.Tensor,   # [B] int32, -1 to skip
-    accepted_len: torch.Tensor, # [B] int32, in [0, T]
+    k: torch.Tensor,  # [B, T, H,  K] bf16 — read when k_buf is None
+    v: torch.Tensor,  # [B, T, HV, V] bf16 — read when v_buf is None
+    s: torch.Tensor,  # [pool_size, HV, V, K] fp32, WRITTEN IN PLACE
+    decay_scales: torch.Tensor,  # [H] fp32
+    h0_indices: torch.Tensor,  # [B] int32, -1 to skip
+    accepted_len: torch.Tensor,  # [B] int32, in [0, T]
     T: int,
     k_buf: torch.Tensor | None = None,  # [pool_size, T, H, K] bf16
     v_buf: torch.Tensor | None = None,  # [pool_size, T, HV, V] bf16
@@ -222,7 +244,17 @@ def linear_attention_state_update_kvbuffer(
     use_packed_fma = major >= 10
 
     cache_key = (
-        B, T, H, HV, K, V, pool_size, tile_v, vec_size, ilp_rows, use_packed_fma,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_packed_fma,
         read_from_buf,
     )
     cache = _get_compiled_state_update_kernel(*cache_key)
@@ -248,7 +280,12 @@ def linear_attention_state_update_kvbuffer(
             from_dlpack(accepted_len, assumed_align=16),
             from_dlpack(k_buf_t, assumed_align=16),
             from_dlpack(v_buf_t, assumed_align=16),
-            B=B, T=T, H=H, HV=HV, K=K, V=V,
+            B=B,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
             tile_v=tile_v,
             vec_size=vec_size,
             ilp_rows=ilp_rows,
@@ -264,9 +301,11 @@ def linear_attention_state_update_kvbuffer(
     compiled(
         h0_view,
         decay_scales,
-        k, v,
+        k,
+        v,
         h0_indices,
         accepted_len,
-        k_buf_t, v_buf_t,
+        k_buf_t,
+        v_buf_t,
         stream,
     )

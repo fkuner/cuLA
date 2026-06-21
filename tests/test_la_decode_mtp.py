@@ -39,7 +39,55 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
-from _la_mtp_ref import torch_la_mtp_ref
+
+
+# ---------------------------------------------------------------------------
+# Pure PyTorch reference for multi-token Lightning Attention decode
+# ---------------------------------------------------------------------------
+def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_states=False, disable_state_update=False):
+    """
+    Pure PyTorch reference.
+
+    Args:
+        q, k:        [B, T, H,  D] bf16
+        v:           [B, T, HV, D] bf16
+        state:       [B, HV, D, D] fp32 (K-major, V-minor)
+        decay_scales: [H] fp32 (positive; kernel does exp(-x))
+        scale: float
+        T: int
+        cache_intermediate_states: cache per-step state to inter
+        disable_state_update: do not update state_new at end (return state.clone())
+
+    Returns:
+        out:        [B, T, HV, D] bf16
+        state_new:  [B, HV, D, D] fp32
+        inter:      [B*T*HV, D, D] fp32 or None
+    """
+    B, _, H, D = q.shape
+    HV = v.shape[2]
+    q_f = q.float() * scale
+    k_f, v_f = k.float(), v.float()
+    decay_per_q_head = torch.exp(-decay_scales)  # [H]
+    decay_per_hv = decay_per_q_head.repeat_interleave(HV // H).view(1, HV, 1, 1)
+
+    state_running = state.clone()
+    out = torch.zeros(B, T, HV, D, dtype=torch.bfloat16, device=q.device)
+    inter = torch.zeros(B * T * HV, D, D, dtype=torch.float32, device=q.device) if cache_intermediate_states else None
+
+    for t in range(T):
+        q_hv = q_f[:, t].repeat_interleave(HV // H, dim=1)  # [B, HV, D]
+        k_hv = k_f[:, t].repeat_interleave(HV // H, dim=1)  # [B, HV, D]
+        v_t = v_f[:, t]  # [B, HV, D]
+
+        state_running = state_running * decay_per_hv + k_hv.unsqueeze(-1) * v_t.unsqueeze(-2)
+        out[:, t] = torch.einsum("bhk,bhkv->bhv", q_hv, state_running).bfloat16()
+
+        if cache_intermediate_states:
+            for b in range(B):
+                inter[b * T * HV + t * HV : b * T * HV + (t + 1) * HV] = state_running[b]
+
+    state_final = state.clone() if disable_state_update else state_running
+    return out, state_final, inter
 
 
 def _skip_if_no_sm90_or_later():
@@ -64,8 +112,15 @@ def make_inputs(B, T, H, HV, D, device="cuda", seed=42):
 
 
 def run_la_mtp(
-    q, k, v, state_4d, decay_scales, scale, T,
-    cache_intermediate_states=False, disable_state_update=False,
+    q,
+    k,
+    v,
+    state_4d,
+    decay_scales,
+    scale,
+    T,
+    cache_intermediate_states=False,
+    disable_state_update=False,
 ):
     """
     Wraps linear_attention_decode_mtp with proper state-layout conversion.
@@ -131,10 +186,10 @@ def run_la_mtp(
 @pytest.mark.parametrize(
     "B,T,expected_config",
     [
-        (1,  4, "tile_v=8_ilp=2"),
-        (2,  2, "tile_v=16_ilp=4"),
-        (2,  4, "tile_v=16_ilp=4"),
-        (8,  4, "tile_v=32_ilp=4"),
+        (1, 4, "tile_v=8_ilp=2"),
+        (2, 2, "tile_v=16_ilp=4"),
+        (2, 4, "tile_v=16_ilp=4"),
+        (8, 4, "tile_v=32_ilp=4"),
         (32, 2, "tile_v=64_ilp=8"),
         (32, 4, "tile_v=64_ilp=4_smem_v"),
     ],
@@ -194,7 +249,13 @@ def test_disable_state_update():
     state_snapshot = state.clone()
 
     _, state_out, _ = run_la_mtp(
-        q, k, v, state, decay_scales, scale, T,
+        q,
+        k,
+        v,
+        state,
+        decay_scales,
+        scale,
+        T,
         disable_state_update=True,
     )
     assert torch.equal(state_out, state_snapshot), "state was mutated despite disable_state_update=True"
@@ -209,10 +270,24 @@ def test_cache_intermediate_states():
 
     q, k, v, state = make_inputs(B, T, H, HV, D)
     _, _, inter_ref = torch_la_mtp_ref(
-        q, k, v, state, decay_scales, scale, T, cache_intermediate_states=True,
+        q,
+        k,
+        v,
+        state,
+        decay_scales,
+        scale,
+        T,
+        cache_intermediate_states=True,
     )
     _, _, inter_cute = run_la_mtp(
-        q, k, v, state, decay_scales, scale, T, cache_intermediate_states=True,
+        q,
+        k,
+        v,
+        state,
+        decay_scales,
+        scale,
+        T,
+        cache_intermediate_states=True,
     )
 
     rmse = torch.sqrt(torch.mean((inter_cute - inter_ref) ** 2)).item()
@@ -251,7 +326,12 @@ def test_skip_with_negative_offset():
     inter = torch.empty(1, 1, 1, device=q.device, dtype=torch.float32)
     cu_seqlens = torch.empty(1, device=q.device, dtype=torch.int32)
     linear_attention_decode_mtp(
-        q, k, v, s_cute, inter, out,
+        q,
+        k,
+        v,
+        s_cute,
+        inter,
+        out,
         decay_scales=decay_scales,
         s_offsets=s_offsets,
         cu_seqlens=cu_seqlens,
@@ -280,13 +360,16 @@ def test_skip_with_negative_offset_cache_intermediate():
     s_offsets[2] = -1
 
     inter_sentinel = 7.5
-    inter = torch.full(
-        (B * T * HV, D, D), inter_sentinel, device=q.device, dtype=torch.float32
-    )
+    inter = torch.full((B * T * HV, D, D), inter_sentinel, device=q.device, dtype=torch.float32)
     cu_seqlens = torch.empty(1, device=q.device, dtype=torch.int32)
 
     linear_attention_decode_mtp(
-        q, k, v, s_cute, inter, out,
+        q,
+        k,
+        v,
+        s_cute,
+        inter,
+        out,
         decay_scales=decay_scales,
         s_offsets=s_offsets,
         cu_seqlens=cu_seqlens,
@@ -299,8 +382,7 @@ def test_skip_with_negative_offset_cache_intermediate():
 
     skipped = inter[2 * T * HV : 3 * T * HV]
     assert torch.all(skipped == inter_sentinel), (
-        f"intermediate_states for skipped batch was written "
-        f"(min={skipped.min().item()}, max={skipped.max().item()})"
+        f"intermediate_states for skipped batch was written (min={skipped.min().item()}, max={skipped.max().item()})"
     )
 
     others = torch.cat([inter[: 2 * T * HV], inter[3 * T * HV :]], dim=0)

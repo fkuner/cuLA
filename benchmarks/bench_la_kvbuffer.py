@@ -29,7 +29,6 @@ import os
 import sys
 
 import torch
-import triton
 
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))
 
@@ -59,21 +58,21 @@ try:
 except Exception as e:  # noqa: BLE001 — any import failure → run without SGLang
     _HAVE_SGLANG, _SGLANG_ERR = False, repr(e)
 
-from cula.lightning.la_decode_mtp import (
+from cula.lightning.la_decode_mtp import (  # noqa: E402
     get_mtp_config,
     linear_attention_decode_mtp,
 )
-from cula.lightning.la_verify_kvbuffer import (
-    _get_compiled_verify_kvbuffer_kernel,
-    _get_compiled_verify_kvbuffer_kernel_shuffle,
-    linear_attention_verify_kvbuffer,
-    MMA_MIN_T,
-)
-from cula.lightning.la_state_update_kvbuffer import (
+from cula.lightning.la_state_update_kvbuffer import (  # noqa: E402
     _get_compiled_state_update_kernel,
     linear_attention_state_update_kvbuffer,
 )
-from cula.utils import USE_FAST_MATH, get_device_sm_version
+from cula.lightning.la_verify_kvbuffer import (  # noqa: E402
+    MMA_MIN_T,
+    _get_compiled_verify_kvbuffer_kernel,
+    _get_compiled_verify_kvbuffer_kernel_shuffle,
+    linear_attention_verify_kvbuffer,
+)
+from cula.utils import USE_FAST_MATH, get_device_sm_version  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,8 +102,8 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, softmax_scale):
 
     for t in range(T):
         qt = q[:, t].float() * softmax_scale  # [B, H, K]
-        kt = k[:, t].float()                  # [B, H, K]
-        vt = v[:, t].float()                  # [B, H, V]
+        kt = k[:, t].float()  # [B, H, K]
+        vt = v[:, t].float()  # [B, H, V]
         state = state * decay[None, :, None, None] + kt.unsqueeze(-1) * vt.unsqueeze(-2)
         out[:, t] = torch.einsum("bhk,bhkv->bhv", qt, state)
 
@@ -114,9 +113,22 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, softmax_scale):
 # ─────────────────────────────────────────────────────────────────────────────
 # SGLang seg_la MTP wrapper (matches seg_la_fwd MTP path)
 # ─────────────────────────────────────────────────────────────────────────────
-def run_sglang_mtp(q_3d, k_3d, v_3d, s_sglang, caches_sglang,
-                   s_offsets, cache_indices, decay_scales, meta, softmax_scale,
-                   HEAD_DIM, step, K_SPLIT_DIM=32, V_SPLIT_DIM=64):
+def run_sglang_mtp(
+    q_3d,
+    k_3d,
+    v_3d,
+    s_sglang,
+    caches_sglang,
+    s_offsets,
+    cache_indices,
+    decay_scales,
+    meta,
+    softmax_scale,
+    HEAD_DIM,
+    step,
+    K_SPLIT_DIM=32,
+    V_SPLIT_DIM=64,
+):
     """
     Invoke seg_la_mtp_kernel the same way seg_la_fwd does for the MTP path.
 
@@ -130,9 +142,7 @@ def run_sglang_mtp(q_3d, k_3d, v_3d, s_sglang, caches_sglang,
 
     k_dim_block = HEAD_DIM // K_SPLIT_DIM
     v_dim_block = HEAD_DIM // V_SPLIT_DIM
-    tmp = torch.empty(
-        (k_dim_block, length, qo_heads, HEAD_DIM), device=q_3d.device, dtype=q_3d.dtype
-    )
+    tmp = torch.empty((k_dim_block, length, qo_heads, HEAD_DIM), device=q_3d.device, dtype=q_3d.dtype)
     grid = (bs, qo_heads, k_dim_block * v_dim_block)
     num_warps = 2
     num_stages = 3
@@ -166,11 +176,10 @@ def run_sglang_mtp(q_3d, k_3d, v_3d, s_sglang, caches_sglang,
         if length < 2048:
             o = tmp.sum(0)
         else:
-            o = torch.empty(
-                (length, qo_heads, HEAD_DIM), device=q_3d.device, dtype=q_3d.dtype
-            )
+            o = torch.empty((length, qo_heads, HEAD_DIM), device=q_3d.device, dtype=q_3d.dtype)
             seg_la_sum_kernel[(length,)](
-                tmp, o,
+                tmp,
+                o,
                 DIM=qo_heads * HEAD_DIM,
                 NUM_BLOCK=k_dim_block,
                 num_warps=2,
@@ -225,7 +234,7 @@ def benchmark_fn(fn, warmup=30, rep=200):
 def run_config(B, T, H, K, V, layer_idx, num_layers):
     device = "cuda"
     dtype = torch.bfloat16
-    scale = K ** -0.5
+    scale = K**-0.5
     HV = H  # SGLang seg_la does not support GQA
 
     g_gamma = -(8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, device=device, dtype=torch.float32)
@@ -248,10 +257,9 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
     v_3d = v_4d.reshape(length, HV, V).contiguous()
 
     pool_size = B
-    max_ref = torch.abs(o_ref).max().item()
 
     # ── SGLang baseline (optional) ──────────────────────────────────────────
-    rmse_sg = reldiff_sg = float("nan")
+    rmse_sg = float("nan")
     s_sglang = caches_sglang = s_offsets_sg = cache_indices_sg = meta = None
     K_SPLIT_DIM = 32
     V_SPLIT_DIM = 32 if B <= 2 else 64
@@ -280,13 +288,23 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
             s_sg_run = s_sglang.clone()
             c_sg_run = caches_sglang.clone()
             o_sg = run_sglang_mtp(
-                q_3d, k_3d, v_3d, s_sg_run, c_sg_run,
-                s_offsets_sg, cache_indices_sg, decay_scales, meta, scale,
-                K, T, K_SPLIT_DIM, V_SPLIT_DIM,
+                q_3d,
+                k_3d,
+                v_3d,
+                s_sg_run,
+                c_sg_run,
+                s_offsets_sg,
+                cache_indices_sg,
+                decay_scales,
+                meta,
+                scale,
+                K,
+                T,
+                K_SPLIT_DIM,
+                V_SPLIT_DIM,
             )
         o_sg_4d = o_sg.reshape(B, T, HV, V).float()
         rmse_sg = torch.sqrt(torch.mean((o_sg_4d - o_ref) ** 2)).item()
-        reldiff_sg = torch.abs(o_sg_4d - o_ref).max().item() / (max_ref + 1e-8)
 
     # ── cuLA MTP setup ─────────────────────────────────────────────────────
     # SGLang seg_la_mtp writes intermediate caches but does NOT write back S,
@@ -302,7 +320,12 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 
     with torch.no_grad():
         linear_attention_decode_mtp(
-            q_4d, k_4d, v_4d, s_cute, inter, out_cute,
+            q_4d,
+            k_4d,
+            v_4d,
+            s_cute,
+            inter,
+            out_cute,
             decay_scales=decay_scales,
             s_offsets=s_offsets_cu,
             cu_seqlens=cu_seqlens_dummy,
@@ -315,7 +338,6 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 
     out_cute_cmp = out_cute.float()
     rmse_cu = torch.sqrt(torch.mean((out_cute_cmp - o_ref) ** 2)).item()
-    reldiff_cu = torch.abs(out_cute_cmp - o_ref).max().item() / (max_ref + 1e-8)
 
     # ── KVBuffer verify + state-update setup ───────────────────────────────
     s_kvbuf = state_init_kmaj.permute(0, 1, 3, 2).contiguous()  # [B, HV, V, K]
@@ -325,18 +347,29 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 
     with torch.no_grad():
         linear_attention_verify_kvbuffer(
-            q_4d, k_4d, v_4d, s_kvbuf, out_kvbuf,
-            decay_scales, h0_indices_kv, scale, T,
+            q_4d,
+            k_4d,
+            v_4d,
+            s_kvbuf,
+            out_kvbuf,
+            decay_scales,
+            h0_indices_kv,
+            scale,
+            T,
         )
         s_kvbuf_warmup = state_init_kmaj.permute(0, 1, 3, 2).contiguous()
         linear_attention_state_update_kvbuffer(
-            k_4d, v_4d, s_kvbuf_warmup, decay_scales,
-            h0_indices_kv, accepted_len_kv, T,
+            k_4d,
+            v_4d,
+            s_kvbuf_warmup,
+            decay_scales,
+            h0_indices_kv,
+            accepted_len_kv,
+            T,
         )
 
     out_kvbuf_cmp = out_kvbuf.float()
     rmse_kv = torch.sqrt(torch.mean((out_kvbuf_cmp - o_ref) ** 2)).item()
-    reldiff_kv = torch.abs(out_kvbuf_cmp - o_ref).max().item() / (max_ref + 1e-8)
 
     # ==================================================================
     # Kernel-only timing: pre-compiled handles, no Python overhead
@@ -357,9 +390,20 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 
     def kernel_sglang():
         run_sglang_mtp(
-            q_3d, k_3d, v_3d, s_sg_bench, c_sg_bench,
-            s_offsets_sg, cache_indices_sg, decay_scales, meta, scale,
-            K, T, K_SPLIT_DIM, V_SPLIT_DIM,
+            q_3d,
+            k_3d,
+            v_3d,
+            s_sg_bench,
+            c_sg_bench,
+            s_offsets_sg,
+            cache_indices_sg,
+            decay_scales,
+            meta,
+            scale,
+            K,
+            T,
+            K_SPLIT_DIM,
+            V_SPLIT_DIM,
         )
 
     # ---- SGLang commit setup ----
@@ -367,8 +411,15 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 
     def kernel_sglang_commit():
         run_sglang_commit(
-            s_sg_bench, c_sg_bench, s_offsets_sg.int(),
-            step_indices_sg, B, H, K, V, T,
+            s_sg_bench,
+            c_sg_bench,
+            s_offsets_sg.int(),
+            step_indices_sg,
+            B,
+            H,
+            K,
+            V,
+            T,
         )
 
     # ---- cuLA KVBuffer with actual buffer write/read ----
@@ -379,9 +430,17 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
     s_kvbuf_compile = state_init_kmaj.permute(0, 1, 3, 2).contiguous()
     out_compile = torch.zeros(B, T, HV, V, device=device, dtype=dtype)
     linear_attention_verify_kvbuffer(
-        q_4d, k_4d, v_4d, s_kvbuf_compile, out_compile,
-        decay_scales, h0_indices_kv, scale, T,
-        k_buf=k_buf_bench, v_buf=v_buf_bench,
+        q_4d,
+        k_4d,
+        v_4d,
+        s_kvbuf_compile,
+        out_compile,
+        decay_scales,
+        h0_indices_kv,
+        scale,
+        T,
+        k_buf=k_buf_bench,
+        v_buf=v_buf_bench,
     )
 
     # linear_attention_verify_kvbuffer dispatches by T: MMA kernel for T>=MMA_MIN_T,
@@ -392,15 +451,36 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
         if ilp_rows_kv < 8 and (tile_v_kv // 4) % 8 == 0:
             ilp_rows_kv = 8
         verify_buf_cache = _get_compiled_verify_kvbuffer_kernel(
-            B, T, H, HV, K, V, pool_size, scale,
-            tile_v_kv, vec_size_kv, ilp_rows_kv, use_smem_v_kv, use_packed_fma,
+            B,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            pool_size,
+            scale,
+            tile_v_kv,
+            vec_size_kv,
+            ilp_rows_kv,
+            use_smem_v_kv,
+            use_packed_fma,
             True,  # write_kv
         )
     else:
         # shuffle kernel: cache_key has no use_smem_v slot
         verify_buf_cache = _get_compiled_verify_kvbuffer_kernel_shuffle(
-            B, T, H, HV, K, V, pool_size, scale,
-            tile_v_kv, vec_size_kv, ilp_rows_kv, use_packed_fma,
+            B,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            pool_size,
+            scale,
+            tile_v_kv,
+            vec_size_kv,
+            ilp_rows_kv,
+            use_packed_fma,
             True,  # write_kv
         )
     compiled_verify_buf = verify_buf_cache["compiled"]
@@ -411,23 +491,44 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
     def kernel_kvbuf_verify_with_write():
         compiled_verify_buf(
             s_kvbuf_kk_vb,
-            decay_scales, q_4d, k_4d, v_4d, out_kvbuf_kk,
+            decay_scales,
+            q_4d,
+            k_4d,
+            v_4d,
+            out_kvbuf_kk,
             h0_indices_kv,
-            k_buf_bench, v_buf_bench,
+            k_buf_bench,
+            v_buf_bench,
             stream_handle,
         )
 
     # Trigger compilation for read_from_buf=True variant
     s_kvbuf_warmup2 = state_init_kmaj.permute(0, 1, 3, 2).contiguous()
     linear_attention_state_update_kvbuffer(
-        k_4d, v_4d, s_kvbuf_warmup2, decay_scales,
-        h0_indices_kv, accepted_len_kv, T,
-        k_buf=k_buf_bench, v_buf=v_buf_bench,
+        k_4d,
+        v_4d,
+        s_kvbuf_warmup2,
+        decay_scales,
+        h0_indices_kv,
+        accepted_len_kv,
+        T,
+        k_buf=k_buf_bench,
+        v_buf=v_buf_bench,
     )
 
     tile_v_su, vec_size_su, ilp_rows_su, _smem_su = get_mtp_config(B, T, HV, V, False)
     update_buf_cache_key = (
-        B, T, H, HV, K, V, pool_size, tile_v_su, vec_size_su, ilp_rows_su, use_packed_fma,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tile_v_su,
+        vec_size_su,
+        ilp_rows_su,
+        use_packed_fma,
         True,  # read_from_buf
     )
     update_buf_cache = _get_compiled_state_update_kernel(*update_buf_cache_key)
@@ -438,9 +539,13 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
     def kernel_kvbuf_update_from_buf():
         compiled_update_buf(
             s_kvbuf_kk_ub,
-            decay_scales, k_4d, v_4d,
-            h0_indices_kv, accepted_len_kv,
-            k_buf_bench, v_buf_bench,
+            decay_scales,
+            k_4d,
+            v_4d,
+            h0_indices_kv,
+            accepted_len_kv,
+            k_buf_bench,
+            v_buf_bench,
             stream_handle,
         )
 
@@ -477,8 +582,7 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Benchmark la_decode_mtp vs SGLang seg_la")
-    parser.add_argument("--batch-sizes", type=int, nargs="+",
-                        default=[1, 2, 4, 8, 16, 32, 64, 128])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128])
     parser.add_argument("--T", type=int, nargs="+", default=[2, 4, 8])
     parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -491,10 +595,10 @@ def main():
 
     print("LA KVBuffer verify + state-update benchmark (cuLA, optional SGLang baseline)")
     print(f"  H={H}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
-    print(f"  dtype=bf16, state=fp32")
+    print("  dtype=bf16, state=fp32")
     print(f"  USE_FAST_MATH={USE_FAST_MATH}")
-    print(f"  cuLA MTP: cache_intermediate_states=True, disable_state_update=True")
-    print(f"  Timing: kernel-only (cuLA pre-compiled handle; SGLang no extra .clone())")
+    print("  cuLA MTP: cache_intermediate_states=True, disable_state_update=True")
+    print("  Timing: kernel-only (cuLA pre-compiled handle; SGLang no extra .clone())")
     if _HAVE_SGLANG:
         print("  SGLang baseline: AVAILABLE (sg_* columns active)")
     else:

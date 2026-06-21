@@ -46,17 +46,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
     from fla.ops.common.fused_recurrent import fused_recurrent_fwd
+
     HAS_FLA = True
 except ImportError:
     HAS_FLA = False
 
-from cula.ops.la_decode import _get_compiled_kernel as _get_la_decode_cache
-from cula.ops.la_decode import linear_attention_decode
 from cula.lightning.la_decode_mtp import (
     _get_compiled_la_mtp_kernel,
     get_mtp_config,
     linear_attention_decode_mtp,
 )
+from cula.ops.la_decode import linear_attention_decode
 from cula.utils import USE_FAST_MATH, get_device_sm_version
 
 
@@ -88,10 +88,10 @@ def benchmark_fn(fn, warmup=30, rep=200):
 # ─────────────────────────────────────────────────────────────────────────────
 def la_mtp_bytes(B, T, H, HV, K, V, cache_intermediate_states, disable_state_update):
     bf16, fp32 = 2, 4
-    qkv   = B * T * H * K * bf16 * 2 + B * T * HV * V * bf16          # q, k, v reads
-    out_w = B * T * HV * V * bf16                                      # o writes
-    h0_r  = B * HV * V * K * fp32                                      # h0 reads
-    h0_w  = 0 if disable_state_update else B * HV * V * K * fp32       # h0 writes
+    qkv = B * T * H * K * bf16 * 2 + B * T * HV * V * bf16  # q, k, v reads
+    out_w = B * T * HV * V * bf16  # o writes
+    h0_r = B * HV * V * K * fp32  # h0 reads
+    h0_w = 0 if disable_state_update else B * HV * V * K * fp32  # h0 writes
     inter = B * T * HV * V * K * fp32 if cache_intermediate_states else 0
     return qkv + out_w + h0_r + h0_w + inter
 
@@ -104,15 +104,16 @@ def sol_pct(byte_count: int, kernel_ms: float, peak_bps: float) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # Core benchmark for one (B, T) configuration
 # ─────────────────────────────────────────────────────────────────────────────
-def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
-               cache_intermediate_states=False, disable_state_update=False):
+def run_config(
+    B, T, H, HV, K, V, layer_idx, num_layers, peak_bps, cache_intermediate_states=False, disable_state_update=False
+):
     device = "cuda"
     dtype = torch.bfloat16
     scale = K**-0.5
 
     # Per-head log decay (Lightning Attention formula)
     g_gamma = -(8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, device=device, dtype=torch.float32)
-    decay_scales = -g_gamma                          # la_decode_mtp convention: exp(-decay_scales)
+    decay_scales = -g_gamma  # la_decode_mtp convention: exp(-decay_scales)
 
     # ── Random inputs ──────────────────────────────────────────────────────
     torch.manual_seed(42)
@@ -127,16 +128,18 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
         state_fla = state_init.clone()
         with torch.no_grad():
             o_fla_fp32, ht_fla = fused_recurrent_fwd(
-                q_4d, k_4d, v_4d,
+                q_4d,
+                k_4d,
+                v_4d,
                 g_gamma=g_gamma,
                 scale=scale,
                 initial_state=state_fla,
                 output_final_state=True,
             )
-        o_fla = o_fla_fp32.to(dtype)   # [B, T, H, V] (fla expects HV==H)
+        o_fla = o_fla_fp32.to(dtype)  # [B, T, H, V] (fla expects HV==H)
 
     # ── cula MTP ───────────────────────────────────────────────────────────
-    s_cute = state_init.clone().permute(0, 1, 3, 2).contiguous()      # [B, HV, V, K]
+    s_cute = state_init.clone().permute(0, 1, 3, 2).contiguous()  # [B, HV, V, K]
     out_cute = torch.zeros(B, T, HV, V, device=device, dtype=dtype)
     s_offsets = torch.arange(B, device=device, dtype=torch.int32)
     inter = torch.empty(1, 1, 1, device=device, dtype=torch.float32)  # dummy
@@ -147,7 +150,12 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
 
     with torch.no_grad():
         linear_attention_decode_mtp(
-            q_4d, k_4d, v_4d, s_cute, inter, out_cute,
+            q_4d,
+            k_4d,
+            v_4d,
+            s_cute,
+            inter,
+            out_cute,
             decay_scales=decay_scales,
             s_offsets=s_offsets,
             cu_seqlens=cu_seqlens_dummy,
@@ -172,8 +180,17 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
     # ==================================================================
     pool_size = B
     cache_key = (
-        B, T, H, HV, K, V, pool_size, scale,
-        disable_state_update, cache_intermediate_states, False,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        scale,
+        disable_state_update,
+        cache_intermediate_states,
+        False,
         *get_mtp_config(B, T, HV, V, disable_state_update),
         get_device_sm_version(q_4d.device)[0] >= 10,
     )
@@ -187,9 +204,16 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
 
     def kernel_cute_mtp():
         compiled_cute(
-            state_kk, inter_kk,
-            decay_scales, q_4d, k_4d, v_4d, out_kk,
-            s_offsets, cu_seqlens_dummy, stream_handle,
+            state_kk,
+            inter_kk,
+            decay_scales,
+            q_4d,
+            k_4d,
+            v_4d,
+            out_kk,
+            s_offsets,
+            cu_seqlens_dummy,
+            stream_handle,
         )
 
     # cula T-sequential baseline: T calls to la_decode (T=1 each)
@@ -202,12 +226,22 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
     def kernel_cute_seq():
         for t in range(T):
             linear_attention_decode(
-                q_slices[t], k_slices[t], v_slices[t], state_seq, out_seq_buf,
+                q_slices[t],
+                k_slices[t],
+                v_slices[t],
+                state_seq,
+                out_seq_buf,
                 softmax_scale=scale,
-                stride_q=0, stride_k=0, stride_v=0, stride_s=0, stride_o=0,
+                stride_q=0,
+                stride_k=0,
+                stride_v=0,
+                stride_s=0,
+                stride_o=0,
                 s_offsets=s_offsets,
                 decay_scales=decay_scales,
-                HEAD_DIM=K, K_SPLIT_DIM=K, V_SPLIT_DIM=V,
+                HEAD_DIM=K,
+                K_SPLIT_DIM=K,
+                V_SPLIT_DIM=V,
             )
 
     # fla kernel-only mode would require careful pre-allocation; use wrapper for fla.
@@ -220,11 +254,20 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
     # ==================================================================
     s_wrap = state_init.clone().permute(0, 1, 3, 2).contiguous()
     out_wrap = torch.empty(B, T, HV, V, device=device, dtype=dtype)
-    inter_wrap = torch.zeros(B * T * HV, V, K, device=device, dtype=torch.float32) if cache_intermediate_states else torch.empty(1, 1, 1, device=device, dtype=torch.float32)
+    inter_wrap = (
+        torch.zeros(B * T * HV, V, K, device=device, dtype=torch.float32)
+        if cache_intermediate_states
+        else torch.empty(1, 1, 1, device=device, dtype=torch.float32)
+    )
 
     def wrapper_cute_mtp():
         linear_attention_decode_mtp(
-            q_4d, k_4d, v_4d, s_wrap, inter_wrap, out_wrap,
+            q_4d,
+            k_4d,
+            v_4d,
+            s_wrap,
+            inter_wrap,
+            out_wrap,
             decay_scales=decay_scales,
             s_offsets=s_offsets,
             cu_seqlens=cu_seqlens_dummy,
@@ -245,7 +288,9 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
 
         def wrapper_fla():
             fused_recurrent_fwd(
-                q_4d, k_4d, v_4d,
+                q_4d,
+                k_4d,
+                v_4d,
                 g_gamma=g_gamma,
                 scale=scale,
                 initial_state=state_fla_bench,
@@ -257,7 +302,12 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
 
     # ── Roofline ────────────────────────────────────────────────────────
     bytes_moved = la_mtp_bytes(
-        B, T, H, HV, K, V,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
         cache_intermediate_states=cache_intermediate_states,
         disable_state_update=disable_state_update,
     )
@@ -267,7 +317,8 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
     speedup_fla = fla_ms / cute_mtp_ms if HAS_FLA else float("nan")
 
     return {
-        "B": B, "T": T,
+        "B": B,
+        "T": T,
         "cute_mtp_ms": cute_mtp_ms,
         "cute_seq_ms": cute_seq_ms,
         "fla_ms": fla_ms,
@@ -286,17 +337,14 @@ def run_config(B, T, H, HV, K, V, layer_idx, num_layers, peak_bps,
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Benchmark la_decode_mtp")
-    parser.add_argument("--batch-sizes", type=int, nargs="+",
-                        default=[1, 2, 4, 8, 16, 32, 64, 128])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128])
     parser.add_argument("--T", type=int, nargs="+", default=[2, 4, 8])
     parser.add_argument("--heads", type=int, default=32)
-    parser.add_argument("--num-v-heads", type=int, default=None,
-                        help="HV (defaults to --heads for MHA)")
+    parser.add_argument("--num-v-heads", type=int, default=None, help="HV (defaults to --heads for MHA)")
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--layer-idx", type=int, default=12)
     parser.add_argument("--num-layers", type=int, default=24)
-    parser.add_argument("--peak-bps", type=float, default=8e12,
-                        help="HBM peak bytes/sec for SOL%% (B200 HBM3e ≈ 8e12)")
+    parser.add_argument("--peak-bps", type=float, default=8e12, help="HBM peak bytes/sec for SOL%% (B200 HBM3e ≈ 8e12)")
     parser.add_argument("--cache-intermediate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--disable-state-update", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
@@ -308,8 +356,7 @@ def main():
     print("Lightning Attention MTP Decode Benchmark")
     print(f"  H={H}, HV={HV}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
     print(f"  dtype=bf16, state=fp32, peak={args.peak_bps:.2e} B/s")
-    print(f"  cache_intermediate_states={args.cache_intermediate}, "
-          f"disable_state_update={args.disable_state_update}")
+    print(f"  cache_intermediate_states={args.cache_intermediate}, disable_state_update={args.disable_state_update}")
     print(f"  USE_FAST_MATH={USE_FAST_MATH}, fla available={HAS_FLA}")
 
     fla_avail = HAS_FLA and HV == H  # fla expects HV == H
@@ -327,8 +374,15 @@ def main():
     for T in args.T:
         for B in args.batch_sizes:
             r = run_config(
-                B, T, H, HV, K, V,
-                args.layer_idx, args.num_layers, args.peak_bps,
+                B,
+                T,
+                H,
+                HV,
+                K,
+                V,
+                args.layer_idx,
+                args.num_layers,
+                args.peak_bps,
                 cache_intermediate_states=args.cache_intermediate,
                 disable_state_update=args.disable_state_update,
             )

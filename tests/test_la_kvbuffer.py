@@ -24,8 +24,58 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
 from cula.lightning.la_state_update_kvbuffer import linear_attention_state_update_kvbuffer
-from _la_mtp_ref import torch_la_mtp_ref
+from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
+
+
+# ---------------------------------------------------------------------------
+# Pure PyTorch reference for multi-token Lightning Attention decode
+# ---------------------------------------------------------------------------
+def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_states=False, disable_state_update=False):
+    """
+    Pure PyTorch reference.
+
+    Args:
+        q, k:        [B, T, H,  D] bf16
+        v:           [B, T, HV, D] bf16
+        state:       [B, HV, D, D] fp32 (K-major, V-minor)
+        decay_scales: [H] fp32 (positive; kernel does exp(-x))
+        scale: float
+        T: int
+        cache_intermediate_states: cache per-step state to inter
+        disable_state_update: do not update state_new at end (return state.clone())
+
+    Returns:
+        out:        [B, T, HV, D] bf16
+        state_new:  [B, HV, D, D] fp32
+        inter:      [B*T*HV, D, D] fp32 or None
+    """
+    B, _, H, D = q.shape
+    HV = v.shape[2]
+    q_f = q.float() * scale
+    k_f, v_f = k.float(), v.float()
+    decay_per_q_head = torch.exp(-decay_scales)  # [H]
+    decay_per_hv = decay_per_q_head.repeat_interleave(HV // H).view(1, HV, 1, 1)
+
+    state_running = state.clone()
+    out = torch.zeros(B, T, HV, D, dtype=torch.bfloat16, device=q.device)
+    inter = torch.zeros(B * T * HV, D, D, dtype=torch.float32, device=q.device) if cache_intermediate_states else None
+
+    for t in range(T):
+        q_hv = q_f[:, t].repeat_interleave(HV // H, dim=1)  # [B, HV, D]
+        k_hv = k_f[:, t].repeat_interleave(HV // H, dim=1)  # [B, HV, D]
+        v_t = v_f[:, t]  # [B, HV, D]
+
+        state_running = state_running * decay_per_hv + k_hv.unsqueeze(-1) * v_t.unsqueeze(-2)
+        out[:, t] = torch.einsum("bhk,bhkv->bhv", q_hv, state_running).bfloat16()
+
+        if cache_intermediate_states:
+            for b in range(B):
+                inter[b * T * HV + t * HV : b * T * HV + (t + 1) * HV] = state_running[b]
+
+    state_final = state.clone() if disable_state_update else state_running
+    return out, state_final, inter
 
 
 def _skip_if_no_sm90_or_later():
@@ -58,7 +108,13 @@ def test_state_update_L0_no_op():
     accepted_len = torch.zeros(B, device="cuda", dtype=torch.int32)
 
     linear_attention_state_update_kvbuffer(
-        k, v, s_cute, decay_scales, h0_indices, accepted_len, T,
+        k,
+        v,
+        s_cute,
+        decay_scales,
+        h0_indices,
+        accepted_len,
+        T,
     )
     assert torch.equal(s_cute, s_snapshot), "L=0 must leave state unchanged"
 
@@ -98,7 +154,13 @@ def test_state_update_full_accept(B, T, H, HV, D):
     s_cute = state.permute(0, 1, 3, 2).contiguous().clone()  # [B,HV,V,K]
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_state_update_kvbuffer(
-        k, v, s_cute, decay_scales, h0_indices, L_per_batch, T,
+        k,
+        v,
+        s_cute,
+        decay_scales,
+        h0_indices,
+        L_per_batch,
+        T,
     )
     got = s_cute.permute(0, 1, 3, 2).contiguous()  # back to [B,HV,K,V]
     rmse = torch.sqrt(torch.mean((got - ref) ** 2)).item()
@@ -120,7 +182,13 @@ def test_state_update_partial(L):
     s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_state_update_kvbuffer(
-        k, v, s_cute, decay_scales, h0_indices, L_per_batch, T,
+        k,
+        v,
+        s_cute,
+        decay_scales,
+        h0_indices,
+        L_per_batch,
+        T,
     )
     got = s_cute.permute(0, 1, 3, 2).contiguous()
     rel = torch.sqrt(torch.mean((got - ref) ** 2)).item() / (torch.abs(ref).max().item() + 1e-8)
@@ -140,7 +208,13 @@ def test_state_update_per_batch_L():
     s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_state_update_kvbuffer(
-        k, v, s_cute, decay_scales, h0_indices, L_per_batch, T,
+        k,
+        v,
+        s_cute,
+        decay_scales,
+        h0_indices,
+        L_per_batch,
+        T,
     )
     got = s_cute.permute(0, 1, 3, 2).contiguous()
     for b in range(B):
@@ -162,12 +236,15 @@ def test_state_update_skip_negative_h0_indices():
     L_per_batch = torch.full((B,), T, device="cuda", dtype=torch.int32)
 
     linear_attention_state_update_kvbuffer(
-        k, v, s_cute, decay_scales, h0_indices, L_per_batch, T,
+        k,
+        v,
+        s_cute,
+        decay_scales,
+        h0_indices,
+        L_per_batch,
+        T,
     )
     assert torch.equal(s_cute[2], snapshot_b2), "skipped batch slot was modified"
-
-
-from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
 
 
 def test_verify_skip_negative_h0_indices():
@@ -185,7 +262,15 @@ def test_verify_skip_negative_h0_indices():
     h0_indices[2] = -1
 
     linear_attention_verify_kvbuffer(
-        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+        q,
+        k,
+        v,
+        s_cute,
+        out,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
     )
     assert torch.all(out[2] == sentinel), "skipped batch out slot was modified"
 
@@ -208,10 +293,17 @@ def test_verify_outputs_match_ref(B, T):
     out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_verify_kvbuffer(
-        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+        q,
+        k,
+        v,
+        s_cute,
+        out,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
     )
-    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
-        torch.abs(o_ref.float()).max().item() + 1e-8)
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (torch.abs(o_ref.float()).max().item() + 1e-8)
     assert rel < 1e-2, f"B={B} T={T}: verify output rel RMSE {rel:.6f} too large"
 
 
@@ -228,10 +320,17 @@ def test_verify_different_heads(H, HV):
     out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_verify_kvbuffer(
-        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
+        q,
+        k,
+        v,
+        s_cute,
+        out,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
     )
-    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
-        torch.abs(o_ref.float()).max().item() + 1e-8)
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (torch.abs(o_ref.float()).max().item() + 1e-8)
     assert rel < 1e-2, f"H={H} HV={HV}: verify output mismatch {rel:.6f}"
 
 
@@ -246,8 +345,7 @@ def test_verify_zero_decay():
     out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_verify_kvbuffer(q, k, v, s_cute, out, decay_scales, h0_indices, scale, T)
-    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
-        torch.abs(o_ref.float()).max().item() + 1e-8)
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (torch.abs(o_ref.float()).max().item() + 1e-8)
     assert rel < 1e-2, f"zero decay: {rel:.6f}"
 
 
@@ -263,12 +361,8 @@ def test_verify_zero_state():
     out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_verify_kvbuffer(q, k, v, s_cute, out, decay_scales, h0_indices, scale, T)
-    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (
-        torch.abs(o_ref.float()).max().item() + 1e-8)
+    rel = torch.sqrt(torch.mean((out.float() - o_ref.float()) ** 2)).item() / (torch.abs(o_ref.float()).max().item() + 1e-8)
     assert rel < 1e-2, f"zero state: {rel:.6f}"
-
-
-from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
 
 
 def test_end_to_end_equivalence_with_baseline():
@@ -286,10 +380,20 @@ def test_end_to_end_equivalence_with_baseline():
     inter = torch.zeros(B * T * HV, D, D, device="cuda", dtype=torch.float32)  # [.,V,K]
     cu_seqlens = torch.empty(1, device="cuda", dtype=torch.int32)
     linear_attention_decode_mtp(
-        q, k, v, s_base, inter, out_base,
-        decay_scales=decay_scales, s_offsets=s_offsets, cu_seqlens=cu_seqlens,
-        softmax_scale=scale, T=T,
-        cache_intermediate_states=True, disable_state_update=True, is_varlen=False,
+        q,
+        k,
+        v,
+        s_base,
+        inter,
+        out_base,
+        decay_scales=decay_scales,
+        s_offsets=s_offsets,
+        cu_seqlens=cu_seqlens,
+        softmax_scale=scale,
+        T=T,
+        cache_intermediate_states=True,
+        disable_state_update=True,
+        is_varlen=False,
     )
 
     # ---- KVBuffer: verify writes out; state-update (L=T) writes state ----
@@ -297,23 +401,37 @@ def test_end_to_end_equivalence_with_baseline():
     out_kv = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
     linear_attention_verify_kvbuffer(
-        q, k, v, s_kv, out_kv, decay_scales, h0_indices, scale, T,
+        q,
+        k,
+        v,
+        s_kv,
+        out_kv,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
     )
     accepted_len = torch.full((B,), T, device="cuda", dtype=torch.int32)
     linear_attention_state_update_kvbuffer(
-        k, v, s_kv, decay_scales, h0_indices, accepted_len, T,
+        k,
+        v,
+        s_kv,
+        decay_scales,
+        h0_indices,
+        accepted_len,
+        T,
     )
 
     # (a) outputs match
     rel_o = torch.sqrt(torch.mean((out_kv.float() - out_base.float()) ** 2)).item() / (
-        torch.abs(out_base.float()).max().item() + 1e-8)
+        torch.abs(out_base.float()).max().item() + 1e-8
+    )
     assert rel_o < 1e-2, f"output mismatch vs baseline: {rel_o:.6f}"
 
     # (b) updated state == baseline's last intermediate slice [B,HV,V,K]
-    inter_v = inter.view(B, T, HV, D, D)            # [B,T,HV,V,K]
-    last_state = inter_v[:, T - 1]                  # [B,HV,V,K]
-    rel_s = torch.sqrt(torch.mean((s_kv - last_state) ** 2)).item() / (
-        torch.abs(last_state).max().item() + 1e-8)
+    inter_v = inter.view(B, T, HV, D, D)  # [B,T,HV,V,K]
+    last_state = inter_v[:, T - 1]  # [B,HV,V,K]
+    rel_s = torch.sqrt(torch.mean((s_kv - last_state) ** 2)).item() / (torch.abs(last_state).max().item() + 1e-8)
     assert rel_s < 1e-3, f"state mismatch vs baseline last intermediate: {rel_s:.6f}"
 
 
@@ -334,8 +452,17 @@ def test_verify_writes_kv_buffer(B, T):
     v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
 
     linear_attention_verify_kvbuffer(
-        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
-        k_buf=k_buf, v_buf=v_buf,
+        q,
+        k,
+        v,
+        s_cute,
+        out,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
+        k_buf=k_buf,
+        v_buf=v_buf,
     )
 
     for b in range(B):
@@ -360,14 +487,31 @@ def test_verify_output_unchanged_with_kv_write():
     h0_indices = torch.arange(B, device="cuda", dtype=torch.int32)
 
     linear_attention_verify_kvbuffer(
-        q, k, v, s1, out_no_buf, decay_scales, h0_indices, scale, T,
+        q,
+        k,
+        v,
+        s1,
+        out_no_buf,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
     )
 
     k_buf = torch.zeros(pool_size, T, H, D, device="cuda", dtype=torch.bfloat16)
     v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
     linear_attention_verify_kvbuffer(
-        q, k, v, s2, out_with_buf, decay_scales, h0_indices, scale, T,
-        k_buf=k_buf, v_buf=v_buf,
+        q,
+        k,
+        v,
+        s2,
+        out_with_buf,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
+        k_buf=k_buf,
+        v_buf=v_buf,
     )
 
     assert torch.equal(out_no_buf, out_with_buf), "kv write should not affect output"
@@ -387,7 +531,13 @@ def test_state_update_from_buffer(B, T, H, HV, D):
     # Path A: read from raw k, v
     s_raw = state.permute(0, 1, 3, 2).contiguous().clone()
     linear_attention_state_update_kvbuffer(
-        k, v, s_raw, decay_scales, h0_indices, L_per_batch, T,
+        k,
+        v,
+        s_raw,
+        decay_scales,
+        h0_indices,
+        L_per_batch,
+        T,
     )
 
     # Path B: read from buffer (fill buffer with same k, v)
@@ -399,8 +549,15 @@ def test_state_update_from_buffer(B, T, H, HV, D):
 
     s_buf = state.permute(0, 1, 3, 2).contiguous().clone()
     linear_attention_state_update_kvbuffer(
-        k, v, s_buf, decay_scales, h0_indices, L_per_batch, T,
-        k_buf=k_buf, v_buf=v_buf,
+        k,
+        v,
+        s_buf,
+        decay_scales,
+        h0_indices,
+        L_per_batch,
+        T,
+        k_buf=k_buf,
+        v_buf=v_buf,
     )
 
     assert torch.equal(s_raw, s_buf), "buffer-read state must match raw-read state"
@@ -427,8 +584,17 @@ def test_verify_skip_negative_indices_no_buffer_write():
     h0_indices[2] = -1
 
     linear_attention_verify_kvbuffer(
-        q, k, v, s_cute, out, decay_scales, h0_indices, scale, T,
-        k_buf=k_buf, v_buf=v_buf,
+        q,
+        k,
+        v,
+        s_cute,
+        out,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
+        k_buf=k_buf,
+        v_buf=v_buf,
     )
 
     assert torch.equal(k_buf[2], k_buf_snap[2]), "skipped batch k_buf slot was modified"
@@ -450,11 +616,25 @@ def test_end_to_end_with_buffer():
     s_ref = state.permute(0, 1, 3, 2).contiguous().clone()
     out_ref = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.bfloat16)
     linear_attention_verify_kvbuffer(
-        q, k, v, s_ref, out_ref, decay_scales, h0_indices, scale, T,
+        q,
+        k,
+        v,
+        s_ref,
+        out_ref,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
     )
     accepted_len = torch.full((B,), T, device="cuda", dtype=torch.int32)
     linear_attention_state_update_kvbuffer(
-        k, v, s_ref, decay_scales, h0_indices, accepted_len, T,
+        k,
+        v,
+        s_ref,
+        decay_scales,
+        h0_indices,
+        accepted_len,
+        T,
     )
 
     # Buffer path: verify writes buffer, state_update reads buffer
@@ -464,12 +644,28 @@ def test_end_to_end_with_buffer():
     v_buf = torch.zeros(pool_size, T, HV, D, device="cuda", dtype=torch.bfloat16)
 
     linear_attention_verify_kvbuffer(
-        q, k, v, s_buf, out_buf, decay_scales, h0_indices, scale, T,
-        k_buf=k_buf, v_buf=v_buf,
+        q,
+        k,
+        v,
+        s_buf,
+        out_buf,
+        decay_scales,
+        h0_indices,
+        scale,
+        T,
+        k_buf=k_buf,
+        v_buf=v_buf,
     )
     linear_attention_state_update_kvbuffer(
-        k, v, s_buf, decay_scales, h0_indices, accepted_len, T,
-        k_buf=k_buf, v_buf=v_buf,
+        k,
+        v,
+        s_buf,
+        decay_scales,
+        h0_indices,
+        accepted_len,
+        T,
+        k_buf=k_buf,
+        v_buf=v_buf,
     )
 
     assert torch.equal(out_ref, out_buf), "output mismatch with buffer pipeline"

@@ -469,6 +469,8 @@ def linear_attention_verify_kvbuffer(
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
     tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, True)
+    assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     # The MMA tile has M=8 valid rows, so process 8 V-rows per warp per block:
     # this fills the fragment (vs ilp_rows=4 wasting half the MMA) and halves the
     # number of row-blocks. Only applies when the V-rows-per-warp is a multiple of 8.
@@ -867,6 +869,7 @@ def linear_attention_verify_kvbuffer_shuffle(
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
     tile_v, vec_size, ilp_rows, _ = get_mtp_config(B, T, HV, V, True)
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     major, _ = get_device_sm_version(q.device)
     use_packed_fma = major >= 10
 

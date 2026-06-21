@@ -1032,6 +1032,7 @@ def linear_attention_decode_mtp(
     pool_size = s.shape[0]
 
     tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     major, _ = get_device_sm_version(q.device)
     use_packed_fma = major >= 10
 

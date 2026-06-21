@@ -240,6 +240,7 @@ def linear_attention_state_update_kvbuffer(
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
     tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, False)
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     major, _ = get_device_sm_version(k.device)
     use_packed_fma = major >= 10
 

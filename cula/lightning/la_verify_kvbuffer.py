@@ -717,7 +717,12 @@ def run_la_verify_kvbuffer_shuffle_kernel(
 
     # s_qk_scaled[T][T] + sVdata[T][tile_v] + s_q/s_k[T][vec_size][32]
     threads_per_group = 32
-    smem_bytes = T * T * 4 + T * tile_v * 4 + 2 * T * vec_size * threads_per_group * 4
+    smem_bytes = (
+        T * T * 4                                    # s_qk_scaled
+        + T * tile_v * 4                             # sVdata
+        + 2 * T * vec_size * threads_per_group * 4   # s_q + s_k
+        + 4 * 16                                     # per-allocation 16B alignment padding (4 tensors)
+    )
 
     la_verify_kvbuffer_shuffle_kernel(
         h0_source,

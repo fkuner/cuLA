@@ -82,7 +82,10 @@ def _ref_state_after_L(state, k, v, decay_scales, L_per_batch, T):
     return out
 
 
-@pytest.mark.parametrize("B,T,H,HV,D", [(4, 4, 16, 16, 128), (8, 4, 64, 64, 128)])
+@pytest.mark.parametrize(
+    "B,T,H,HV,D",
+    [(4, 4, 16, 16, 128), (8, 4, 64, 64, 128), (4, 3, 16, 16, 128), (8, 7, 64, 64, 128)],
+)
 def test_state_update_full_accept(B, T, H, HV, D):
     """accepted_len=T everywhere: bit-exact vs baseline recurrence reference."""
     _skip_if_no_sm90_or_later()
@@ -187,7 +190,10 @@ def test_verify_skip_negative_h0_indices():
     assert torch.all(out[2] == sentinel), "skipped batch out slot was modified"
 
 
-@pytest.mark.parametrize("B,T", [(1, 4), (2, 2), (2, 4), (8, 4), (32, 2), (32, 4)])
+@pytest.mark.parametrize(
+    "B,T",
+    [(1, 4), (2, 2), (2, 4), (8, 4), (32, 2), (32, 4), (2, 1), (2, 3), (8, 5), (8, 7)],
+)
 def test_verify_outputs_match_ref(B, T):
     """Verify kernel o matches torch_la_mtp_ref across the baseline configs."""
     _skip_if_no_sm90_or_later()

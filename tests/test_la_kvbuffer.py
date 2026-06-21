@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from cula.lightning.la_update_kvbuffer import linear_attention_state_update_kvbuffer
+from cula.lightning.la_state_update_kvbuffer import linear_attention_state_update_kvbuffer
 from _la_mtp_ref import torch_la_mtp_ref
 
 

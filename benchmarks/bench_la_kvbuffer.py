@@ -69,7 +69,7 @@ from cula.lightning.la_verify_kvbuffer import (
     linear_attention_verify_kvbuffer,
     MMA_MIN_T,
 )
-from cula.lightning.la_update_kvbuffer import (
+from cula.lightning.la_state_update_kvbuffer import (
     _get_compiled_state_update_kernel,
     linear_attention_state_update_kvbuffer,
 )

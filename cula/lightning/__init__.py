@@ -14,7 +14,7 @@
 
 from cula.lightning.la_decode_mtp import linear_attention_decode_mtp
 from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
-from cula.lightning.la_update_kvbuffer import linear_attention_state_update_kvbuffer
+from cula.lightning.la_state_update_kvbuffer import linear_attention_state_update_kvbuffer
 from cula.ops.la_decode import linear_attention_decode
 from cula.ops.lightning_attn_sm100 import (
     LinearAttentionChunkwiseDecay,

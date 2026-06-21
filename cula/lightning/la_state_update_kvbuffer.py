@@ -232,6 +232,7 @@ def linear_attention_state_update_kvbuffer(
     """
     B, T_k, H, K = k.shape
     assert T_k == T, f"k.shape[1]={T_k} doesn't match T={T}"
+    assert K == 128, f"K={K} != 128: kernel hardcodes K=128 (threads_per_group, lane K-coverage)"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
 

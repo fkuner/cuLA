@@ -268,6 +268,12 @@ def la_verify_kvbuffer_kernel(
                     h_g = cute.local_tile(gH0, (1, vec_size), (v_base + row, lane_id))
                     h_s = cute.local_tile(sH0_w, (1, vec_size), (row, lane_id))
                     cute.autovec_copy(h_g, h_s)
+                # Zero the M-padding rows (ilp_rows..BT-1). GEMM1 reads all BT rows;
+                # their outputs are unused, but leaving stale/NaN SMEM as MMA inputs
+                # is unclean — explicitly zero so the fragment is well-defined.
+                for row in cutlass.range_constexpr(ilp_rows, BT):
+                    for c in cutlass.range_constexpr(vec_size):
+                        sH0_w[(row, lane_id * vec_size + c)] = cutlass.Float32(0.0)
                 cute.arch.sync_warp()  # make sH0 writes visible to this warp's GEMM1
 
                 # (b) GEMM1: HQ[row, t] = h0_row . q_t, over the full K.
@@ -453,6 +459,7 @@ def linear_attention_verify_kvbuffer(
 
     B, T_q, H, K = q.shape
     assert T_q == T, f"q.shape[1]={T_q} doesn't match T={T}"
+    assert K == 128, f"K={K} != 128: kernel hardcodes K=128 (threads_per_group, KP=K+4, lane K-coverage)"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
 
@@ -462,12 +469,14 @@ def linear_attention_verify_kvbuffer(
 
     tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, True)
     assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
-    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     # The MMA tile has M=8 valid rows, so process 8 V-rows per warp per block:
     # this fills the fragment (vs ilp_rows=4 wasting half the MMA) and halves the
     # number of row-blocks. Only applies when the V-rows-per-warp is a multiple of 8.
     if ilp_rows < 8 and (tile_v // 4) % 8 == 0:
         ilp_rows = 8
+    # Re-check after the promotion above: a partial row-block (V not a multiple of
+    # the final ilp_rows) would be silently skipped by the kernel's bounds guard.
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
 
     cache_key = (
         B,
@@ -847,6 +856,7 @@ def linear_attention_verify_kvbuffer_shuffle(
     """
     B, T_q, H, K = q.shape
     assert T_q == T, f"q.shape[1]={T_q} doesn't match T={T}"
+    assert K == 128, f"K={K} != 128: kernel hardcodes K=128 (threads_per_group, lane K-coverage)"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
 

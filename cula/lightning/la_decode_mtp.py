@@ -134,15 +134,15 @@ def get_mtp_config(B: int, T: int, HV: int, V: int, disable_state_update: bool) 
 # ============================================================================
 @cute.kernel
 def la_verify_kernel_mtp(
-    h0_source: cute.Tensor,            # [pool_size * HV, V, K] fp32
+    h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32
     intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] fp32 (or dummy)
-    decay_scales: cute.Tensor,         # [H] fp32
-    q: cute.Tensor,                    # [B, T, H, K] bf16
-    k: cute.Tensor,                    # [B, T, H, K] bf16
-    v: cute.Tensor,                    # [B, T, HV, V] bf16
-    o: cute.Tensor,                    # [B, T, HV, V] bf16
-    h0_indices: cute.Tensor,           # [B] int32
-    cu_seqlens: cute.Tensor,           # [B+1] int32 (dummy when is_varlen=False)
+    decay_scales: cute.Tensor,  # [H] fp32
+    q: cute.Tensor,  # [B, T, H, K] bf16
+    k: cute.Tensor,  # [B, T, H, K] bf16
+    v: cute.Tensor,  # [B, T, HV, V] bf16
+    o: cute.Tensor,  # [B, T, HV, V] bf16
+    h0_indices: cute.Tensor,  # [B] int32
+    cu_seqlens: cute.Tensor,  # [B+1] int32 (dummy when is_varlen=False)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -165,9 +165,9 @@ def la_verify_kernel_mtp(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
-    threads_per_group: cutlass.Constexpr[int] = K // vec_size           # 32
-    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group   # 1
-    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp            # 4
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32
+    groups_per_warp: cutlass.Constexpr[int] = 32 // threads_per_group  # 1
+    num_groups: cutlass.Constexpr[int] = 4 * groups_per_warp  # 4
 
     lane_in_group = lane_id % threads_per_group
     group_in_warp = lane_id // threads_per_group
@@ -186,12 +186,8 @@ def la_verify_kernel_mtp(
     # SMEM allocation (sVdata + sOutput only — LA has no Phase 1 work)
     # ------------------------------------------------------------------
     smem = cutlass.utils.SmemAllocator()
-    sVdata = smem.allocate_tensor(
-        cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
-    )
-    sOutput = smem.allocate_tensor(
-        cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
-    )
+    sVdata = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
+    sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
 
     # ------------------------------------------------------------------
     # Register tensors
@@ -201,9 +197,7 @@ def la_verify_kernel_mtp(
     r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     # r_h always declared with 8 rows; ilp_rows constexpr picks which are used.
-    r_h = cute.make_rmem_tensor(
-        cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32
-    )
+    r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
 
     if cache_idx >= 0:
         # r_decay is a T-loop invariant — computed ONCE.
@@ -234,11 +228,13 @@ def la_verify_kernel_mtp(
 
                 if v_idx_b < V:
                     h_tile_a = cute.local_tile(
-                        h0_source, (1, 1, vec_size),
+                        h0_source,
+                        (1, 1, vec_size),
                         (flat_state_idx, v_idx_a, lane_in_group),
                     )
                     h_tile_b = cute.local_tile(
-                        h0_source, (1, 1, vec_size),
+                        h0_source,
+                        (1, 1, vec_size),
                         (flat_state_idx, v_idx_b, lane_in_group),
                     )
                     cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
@@ -246,11 +242,13 @@ def la_verify_kernel_mtp(
 
                     for i_t in cutlass.range_constexpr(T):
                         q_tile = cute.local_tile(
-                            q, (1, 1, 1, vec_size),
+                            q,
+                            (1, 1, 1, vec_size),
                             (i_n, i_t, i_h, lane_in_group),
                         )
                         k_tile = cute.local_tile(
-                            k, (1, 1, 1, vec_size),
+                            k,
+                            (1, 1, 1, vec_size),
                             (i_n, i_t, i_h, lane_in_group),
                         )
                         cute.autovec_copy(q_tile, r_q_bf16)
@@ -269,25 +267,35 @@ def la_verify_kernel_mtp(
 
                         for i in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, i], r_h[0, i + 1] = la_update_pair(
-                                r_h[0, i], r_h[0, i + 1],
-                                r_k[i], r_k[i + 1],
-                                r_v_a, r_decay, use_packed_fma,
+                                r_h[0, i],
+                                r_h[0, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_a,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[1, i], r_h[1, i + 1] = la_update_pair(
-                                r_h[1, i], r_h[1, i + 1],
-                                r_k[i], r_k[i + 1],
-                                r_v_b, r_decay, use_packed_fma,
+                                r_h[1, i],
+                                r_h[1, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_b,
+                                r_decay,
+                                use_packed_fma,
                             )
 
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
-                                intermediate_states, (1, 1, vec_size),
+                                intermediate_states,
+                                (1, 1, vec_size),
                                 (flat_idx, v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
-                                intermediate_states, (1, 1, vec_size),
+                                intermediate_states,
+                                (1, 1, vec_size),
                                 (flat_idx, v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
@@ -298,24 +306,28 @@ def la_verify_kernel_mtp(
                         sum_hq_b_hi = cutlass.Float32(0.0)
                         for i in cutlass.range_constexpr(0, vec_size, 2):
                             sum_hq_a_lo, sum_hq_a_hi = hq_dot_pair(
-                                r_h[0, i], r_h[0, i + 1],
-                                r_q[i], r_q[i + 1],
-                                sum_hq_a_lo, sum_hq_a_hi, use_packed_fma,
+                                r_h[0, i],
+                                r_h[0, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_a_lo,
+                                sum_hq_a_hi,
+                                use_packed_fma,
                             )
                             sum_hq_b_lo, sum_hq_b_hi = hq_dot_pair(
-                                r_h[1, i], r_h[1, i + 1],
-                                r_q[i], r_q[i + 1],
-                                sum_hq_b_lo, sum_hq_b_hi, use_packed_fma,
+                                r_h[1, i],
+                                r_h[1, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_b_lo,
+                                sum_hq_b_hi,
+                                use_packed_fma,
                             )
                         sum_hq_a = sum_hq_a_lo + sum_hq_a_hi
                         sum_hq_b = sum_hq_b_lo + sum_hq_b_hi
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hq_a += cute.arch.shuffle_sync_bfly(sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_b += cute.arch.shuffle_sync_bfly(sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31)
 
                         if lane_in_group == 0:
                             if cutlass.const_expr(use_smem_v):
@@ -328,12 +340,14 @@ def la_verify_kernel_mtp(
 
                     if cutlass.const_expr(not disable_state_update):
                         h_tile_out_a = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_a, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
                         h_tile_out_b = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_b, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
@@ -353,19 +367,23 @@ def la_verify_kernel_mtp(
                 if v_idx_d < V:
                     # Load 4 h-rows ONCE; they stay register-resident across T.
                     h_tile_a = cute.local_tile(
-                        h0_source, (1, 1, vec_size),
+                        h0_source,
+                        (1, 1, vec_size),
                         (flat_state_idx, v_idx_a, lane_in_group),
                     )
                     h_tile_b = cute.local_tile(
-                        h0_source, (1, 1, vec_size),
+                        h0_source,
+                        (1, 1, vec_size),
                         (flat_state_idx, v_idx_b, lane_in_group),
                     )
                     h_tile_c = cute.local_tile(
-                        h0_source, (1, 1, vec_size),
+                        h0_source,
+                        (1, 1, vec_size),
                         (flat_state_idx, v_idx_c, lane_in_group),
                     )
                     h_tile_d = cute.local_tile(
-                        h0_source, (1, 1, vec_size),
+                        h0_source,
+                        (1, 1, vec_size),
                         (flat_state_idx, v_idx_d, lane_in_group),
                     )
                     cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
@@ -376,11 +394,13 @@ def la_verify_kernel_mtp(
                     for i_t in cutlass.range_constexpr(T):
                         # ---- (2a) inline q/k load for this t ----
                         q_tile = cute.local_tile(
-                            q, (1, 1, 1, vec_size),
+                            q,
+                            (1, 1, 1, vec_size),
                             (i_n, i_t, i_h, lane_in_group),
                         )
                         k_tile = cute.local_tile(
-                            k, (1, 1, 1, vec_size),
+                            k,
+                            (1, 1, 1, vec_size),
                             (i_n, i_t, i_h, lane_in_group),
                         )
                         cute.autovec_copy(q_tile, r_q_bf16)
@@ -406,46 +426,66 @@ def la_verify_kernel_mtp(
                         # r_h[j,i] = r_h[j,i] * r_decay + r_k[i] * r_v[j]
                         for i in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, i], r_h[0, i + 1] = la_update_pair(
-                                r_h[0, i], r_h[0, i + 1],
-                                r_k[i], r_k[i + 1],
-                                r_v_a, r_decay, use_packed_fma,
+                                r_h[0, i],
+                                r_h[0, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_a,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[1, i], r_h[1, i + 1] = la_update_pair(
-                                r_h[1, i], r_h[1, i + 1],
-                                r_k[i], r_k[i + 1],
-                                r_v_b, r_decay, use_packed_fma,
+                                r_h[1, i],
+                                r_h[1, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_b,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[2, i], r_h[2, i + 1] = la_update_pair(
-                                r_h[2, i], r_h[2, i + 1],
-                                r_k[i], r_k[i + 1],
-                                r_v_c, r_decay, use_packed_fma,
+                                r_h[2, i],
+                                r_h[2, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_c,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[3, i], r_h[3, i + 1] = la_update_pair(
-                                r_h[3, i], r_h[3, i + 1],
-                                r_k[i], r_k[i + 1],
-                                r_v_d, r_decay, use_packed_fma,
+                                r_h[3, i],
+                                r_h[3, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_d,
+                                r_decay,
+                                use_packed_fma,
                             )
 
                         # ---- (2d) optional intermediate-state cache ----
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
-                                intermediate_states, (1, 1, vec_size),
+                                intermediate_states,
+                                (1, 1, vec_size),
                                 (flat_idx, v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
-                                intermediate_states, (1, 1, vec_size),
+                                intermediate_states,
+                                (1, 1, vec_size),
                                 (flat_idx, v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
                             inter_tile_c = cute.local_tile(
-                                intermediate_states, (1, 1, vec_size),
+                                intermediate_states,
+                                (1, 1, vec_size),
                                 (flat_idx, v_idx_c, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_tile_c)
                             inter_tile_d = cute.local_tile(
-                                intermediate_states, (1, 1, vec_size),
+                                intermediate_states,
+                                (1, 1, vec_size),
                                 (flat_idx, v_idx_d, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
@@ -461,42 +501,50 @@ def la_verify_kernel_mtp(
                         sum_hq_d_hi = cutlass.Float32(0.0)
                         for i in cutlass.range_constexpr(0, vec_size, 2):
                             sum_hq_a_lo, sum_hq_a_hi = hq_dot_pair(
-                                r_h[0, i], r_h[0, i + 1],
-                                r_q[i], r_q[i + 1],
-                                sum_hq_a_lo, sum_hq_a_hi, use_packed_fma,
+                                r_h[0, i],
+                                r_h[0, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_a_lo,
+                                sum_hq_a_hi,
+                                use_packed_fma,
                             )
                             sum_hq_b_lo, sum_hq_b_hi = hq_dot_pair(
-                                r_h[1, i], r_h[1, i + 1],
-                                r_q[i], r_q[i + 1],
-                                sum_hq_b_lo, sum_hq_b_hi, use_packed_fma,
+                                r_h[1, i],
+                                r_h[1, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_b_lo,
+                                sum_hq_b_hi,
+                                use_packed_fma,
                             )
                             sum_hq_c_lo, sum_hq_c_hi = hq_dot_pair(
-                                r_h[2, i], r_h[2, i + 1],
-                                r_q[i], r_q[i + 1],
-                                sum_hq_c_lo, sum_hq_c_hi, use_packed_fma,
+                                r_h[2, i],
+                                r_h[2, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_c_lo,
+                                sum_hq_c_hi,
+                                use_packed_fma,
                             )
                             sum_hq_d_lo, sum_hq_d_hi = hq_dot_pair(
-                                r_h[3, i], r_h[3, i + 1],
-                                r_q[i], r_q[i + 1],
-                                sum_hq_d_lo, sum_hq_d_hi, use_packed_fma,
+                                r_h[3, i],
+                                r_h[3, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_d_lo,
+                                sum_hq_d_hi,
+                                use_packed_fma,
                             )
                         sum_hq_a = sum_hq_a_lo + sum_hq_a_hi
                         sum_hq_b = sum_hq_b_lo + sum_hq_b_hi
                         sum_hq_c = sum_hq_c_lo + sum_hq_c_hi
                         sum_hq_d = sum_hq_d_lo + sum_hq_d_hi
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_a += cute.arch.shuffle_sync_bfly(
-                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_b += cute.arch.shuffle_sync_bfly(
-                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_c += cute.arch.shuffle_sync_bfly(
-                                sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_d += cute.arch.shuffle_sync_bfly(
-                                sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hq_a += cute.arch.shuffle_sync_bfly(sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_b += cute.arch.shuffle_sync_bfly(sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_c += cute.arch.shuffle_sync_bfly(sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_d += cute.arch.shuffle_sync_bfly(sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31)
 
                         # ---- (2f) writeback ----
                         if lane_in_group == 0:
@@ -515,22 +563,26 @@ def la_verify_kernel_mtp(
                     # Final state writeback
                     if cutlass.const_expr(not disable_state_update):
                         h_tile_out_a = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_a, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
                         h_tile_out_b = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_b, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
                         h_tile_out_c = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_c, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
                         h_tile_out_d = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_d, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
@@ -555,18 +607,21 @@ def la_verify_kernel_mtp(
                     # Load 8 h-rows ONCE
                     for j in cutlass.range_constexpr(8):
                         h_tile_j = cute.local_tile(
-                            h0_source, (1, 1, vec_size),
+                            h0_source,
+                            (1, 1, vec_size),
                             (flat_state_idx, v_idx_0 + j, lane_in_group),
                         )
                         cute.autovec_copy(h_tile_j, cute.slice_(r_h, (j, None)))
 
                     for i_t in cutlass.range_constexpr(T):
                         q_tile = cute.local_tile(
-                            q, (1, 1, 1, vec_size),
+                            q,
+                            (1, 1, 1, vec_size),
                             (i_n, i_t, i_h, lane_in_group),
                         )
                         k_tile = cute.local_tile(
-                            k, (1, 1, 1, vec_size),
+                            k,
+                            (1, 1, 1, vec_size),
                             (i_n, i_t, i_h, lane_in_group),
                         )
                         cute.autovec_copy(q_tile, r_q_bf16)
@@ -597,87 +652,176 @@ def la_verify_kernel_mtp(
 
                         for i in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[0, i], r_h[0, i + 1] = la_update_pair(
-                                r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1],
-                                r_v_0, r_decay, use_packed_fma,
+                                r_h[0, i],
+                                r_h[0, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_0,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[1, i], r_h[1, i + 1] = la_update_pair(
-                                r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1],
-                                r_v_1, r_decay, use_packed_fma,
+                                r_h[1, i],
+                                r_h[1, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_1,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[2, i], r_h[2, i + 1] = la_update_pair(
-                                r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1],
-                                r_v_2, r_decay, use_packed_fma,
+                                r_h[2, i],
+                                r_h[2, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_2,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[3, i], r_h[3, i + 1] = la_update_pair(
-                                r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1],
-                                r_v_3, r_decay, use_packed_fma,
+                                r_h[3, i],
+                                r_h[3, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_3,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[4, i], r_h[4, i + 1] = la_update_pair(
-                                r_h[4, i], r_h[4, i + 1], r_k[i], r_k[i + 1],
-                                r_v_4, r_decay, use_packed_fma,
+                                r_h[4, i],
+                                r_h[4, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_4,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[5, i], r_h[5, i + 1] = la_update_pair(
-                                r_h[5, i], r_h[5, i + 1], r_k[i], r_k[i + 1],
-                                r_v_5, r_decay, use_packed_fma,
+                                r_h[5, i],
+                                r_h[5, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_5,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[6, i], r_h[6, i + 1] = la_update_pair(
-                                r_h[6, i], r_h[6, i + 1], r_k[i], r_k[i + 1],
-                                r_v_6, r_decay, use_packed_fma,
+                                r_h[6, i],
+                                r_h[6, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_6,
+                                r_decay,
+                                use_packed_fma,
                             )
                             r_h[7, i], r_h[7, i + 1] = la_update_pair(
-                                r_h[7, i], r_h[7, i + 1], r_k[i], r_k[i + 1],
-                                r_v_7, r_decay, use_packed_fma,
+                                r_h[7, i],
+                                r_h[7, i + 1],
+                                r_k[i],
+                                r_k[i + 1],
+                                r_v_7,
+                                r_decay,
+                                use_packed_fma,
                             )
 
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             for j in cutlass.range_constexpr(8):
                                 inter_tile_j = cute.local_tile(
-                                    intermediate_states, (1, 1, vec_size),
+                                    intermediate_states,
+                                    (1, 1, vec_size),
                                     (flat_idx, v_idx_0 + j, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (j, None)), inter_tile_j)
 
-                        sum_hq_0_lo = cutlass.Float32(0.0); sum_hq_0_hi = cutlass.Float32(0.0)
-                        sum_hq_1_lo = cutlass.Float32(0.0); sum_hq_1_hi = cutlass.Float32(0.0)
-                        sum_hq_2_lo = cutlass.Float32(0.0); sum_hq_2_hi = cutlass.Float32(0.0)
-                        sum_hq_3_lo = cutlass.Float32(0.0); sum_hq_3_hi = cutlass.Float32(0.0)
-                        sum_hq_4_lo = cutlass.Float32(0.0); sum_hq_4_hi = cutlass.Float32(0.0)
-                        sum_hq_5_lo = cutlass.Float32(0.0); sum_hq_5_hi = cutlass.Float32(0.0)
-                        sum_hq_6_lo = cutlass.Float32(0.0); sum_hq_6_hi = cutlass.Float32(0.0)
-                        sum_hq_7_lo = cutlass.Float32(0.0); sum_hq_7_hi = cutlass.Float32(0.0)
+                        sum_hq_0_lo = cutlass.Float32(0.0)
+                        sum_hq_0_hi = cutlass.Float32(0.0)
+                        sum_hq_1_lo = cutlass.Float32(0.0)
+                        sum_hq_1_hi = cutlass.Float32(0.0)
+                        sum_hq_2_lo = cutlass.Float32(0.0)
+                        sum_hq_2_hi = cutlass.Float32(0.0)
+                        sum_hq_3_lo = cutlass.Float32(0.0)
+                        sum_hq_3_hi = cutlass.Float32(0.0)
+                        sum_hq_4_lo = cutlass.Float32(0.0)
+                        sum_hq_4_hi = cutlass.Float32(0.0)
+                        sum_hq_5_lo = cutlass.Float32(0.0)
+                        sum_hq_5_hi = cutlass.Float32(0.0)
+                        sum_hq_6_lo = cutlass.Float32(0.0)
+                        sum_hq_6_hi = cutlass.Float32(0.0)
+                        sum_hq_7_lo = cutlass.Float32(0.0)
+                        sum_hq_7_hi = cutlass.Float32(0.0)
                         for i in cutlass.range_constexpr(0, vec_size, 2):
                             sum_hq_0_lo, sum_hq_0_hi = hq_dot_pair(
-                                r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_0_lo, sum_hq_0_hi, use_packed_fma,
+                                r_h[0, i],
+                                r_h[0, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_0_lo,
+                                sum_hq_0_hi,
+                                use_packed_fma,
                             )
                             sum_hq_1_lo, sum_hq_1_hi = hq_dot_pair(
-                                r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_1_lo, sum_hq_1_hi, use_packed_fma,
+                                r_h[1, i],
+                                r_h[1, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_1_lo,
+                                sum_hq_1_hi,
+                                use_packed_fma,
                             )
                             sum_hq_2_lo, sum_hq_2_hi = hq_dot_pair(
-                                r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_2_lo, sum_hq_2_hi, use_packed_fma,
+                                r_h[2, i],
+                                r_h[2, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_2_lo,
+                                sum_hq_2_hi,
+                                use_packed_fma,
                             )
                             sum_hq_3_lo, sum_hq_3_hi = hq_dot_pair(
-                                r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_3_lo, sum_hq_3_hi, use_packed_fma,
+                                r_h[3, i],
+                                r_h[3, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_3_lo,
+                                sum_hq_3_hi,
+                                use_packed_fma,
                             )
                             sum_hq_4_lo, sum_hq_4_hi = hq_dot_pair(
-                                r_h[4, i], r_h[4, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_4_lo, sum_hq_4_hi, use_packed_fma,
+                                r_h[4, i],
+                                r_h[4, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_4_lo,
+                                sum_hq_4_hi,
+                                use_packed_fma,
                             )
                             sum_hq_5_lo, sum_hq_5_hi = hq_dot_pair(
-                                r_h[5, i], r_h[5, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_5_lo, sum_hq_5_hi, use_packed_fma,
+                                r_h[5, i],
+                                r_h[5, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_5_lo,
+                                sum_hq_5_hi,
+                                use_packed_fma,
                             )
                             sum_hq_6_lo, sum_hq_6_hi = hq_dot_pair(
-                                r_h[6, i], r_h[6, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_6_lo, sum_hq_6_hi, use_packed_fma,
+                                r_h[6, i],
+                                r_h[6, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_6_lo,
+                                sum_hq_6_hi,
+                                use_packed_fma,
                             )
                             sum_hq_7_lo, sum_hq_7_hi = hq_dot_pair(
-                                r_h[7, i], r_h[7, i + 1], r_q[i], r_q[i + 1],
-                                sum_hq_7_lo, sum_hq_7_hi, use_packed_fma,
+                                r_h[7, i],
+                                r_h[7, i + 1],
+                                r_q[i],
+                                r_q[i + 1],
+                                sum_hq_7_lo,
+                                sum_hq_7_hi,
+                                use_packed_fma,
                             )
                         sum_hq_0 = sum_hq_0_lo + sum_hq_0_hi
                         sum_hq_1 = sum_hq_1_lo + sum_hq_1_hi
@@ -688,30 +832,14 @@ def la_verify_kernel_mtp(
                         sum_hq_6 = sum_hq_6_lo + sum_hq_6_hi
                         sum_hq_7 = sum_hq_7_lo + sum_hq_7_hi
                         for offset in [16, 8, 4, 2, 1]:
-                            sum_hq_0 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_0, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_1 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_1, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_2 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_2, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_3 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_3, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_4 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_4, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_5 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_5, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_6 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_6, offset=offset, mask=-1, mask_and_clamp=31
-                            )
-                            sum_hq_7 += cute.arch.shuffle_sync_bfly(
-                                sum_hq_7, offset=offset, mask=-1, mask_and_clamp=31
-                            )
+                            sum_hq_0 += cute.arch.shuffle_sync_bfly(sum_hq_0, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_1 += cute.arch.shuffle_sync_bfly(sum_hq_1, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_2 += cute.arch.shuffle_sync_bfly(sum_hq_2, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_3 += cute.arch.shuffle_sync_bfly(sum_hq_3, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_4 += cute.arch.shuffle_sync_bfly(sum_hq_4, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_5 += cute.arch.shuffle_sync_bfly(sum_hq_5, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_6 += cute.arch.shuffle_sync_bfly(sum_hq_6, offset=offset, mask=-1, mask_and_clamp=31)
+                            sum_hq_7 += cute.arch.shuffle_sync_bfly(sum_hq_7, offset=offset, mask=-1, mask_and_clamp=31)
 
                         if lane_in_group == 0:
                             if cutlass.const_expr(use_smem_v):
@@ -737,7 +865,8 @@ def la_verify_kernel_mtp(
                     if cutlass.const_expr(not disable_state_update):
                         for j in cutlass.range_constexpr(8):
                             h_tile_out_j = cute.local_tile(
-                                h0_source, (1, 1, vec_size),
+                                h0_source,
+                                (1, 1, vec_size),
                                 (flat_state_idx, v_idx_0 + j, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (j, None)), h_tile_out_j)
@@ -862,15 +991,15 @@ def _get_compiled_la_mtp_kernel(
 # Public Python entry point
 # ============================================================================
 def linear_attention_decode_mtp(
-    q: torch.Tensor,                    # [B, T, H, K] bf16
-    k: torch.Tensor,                    # [B, T, H, K] bf16
-    v: torch.Tensor,                    # [B, T, HV, V] bf16
-    s: torch.Tensor,                    # [pool_size, HV, V, K] fp32
+    q: torch.Tensor,  # [B, T, H, K] bf16
+    k: torch.Tensor,  # [B, T, H, K] bf16
+    v: torch.Tensor,  # [B, T, HV, V] bf16
+    s: torch.Tensor,  # [pool_size, HV, V, K] fp32
     intermediate_states: torch.Tensor,  # [pool_size*T*HV, V, K] fp32 (or dummy)
-    out: torch.Tensor,                  # [B, T, HV, V] bf16
-    decay_scales: torch.Tensor,         # [H] fp32
-    s_offsets: torch.Tensor,            # [B] int32 (-1 to skip)
-    cu_seqlens: torch.Tensor,           # [B+1] int32 (reserved; see note below)
+    out: torch.Tensor,  # [B, T, HV, V] bf16
+    decay_scales: torch.Tensor,  # [H] fp32
+    s_offsets: torch.Tensor,  # [B] int32 (-1 to skip)
+    cu_seqlens: torch.Tensor,  # [B+1] int32 (reserved; see note below)
     softmax_scale: float,
     T: int,
     cache_intermediate_states: bool,
@@ -907,9 +1036,22 @@ def linear_attention_decode_mtp(
     use_packed_fma = major >= 10
 
     cache_key = (
-        B, T, H, HV, K, V, pool_size, softmax_scale,
-        disable_state_update, cache_intermediate_states, is_varlen,
-        tile_v, vec_size, ilp_rows, use_smem_v, use_packed_fma,
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        softmax_scale,
+        disable_state_update,
+        cache_intermediate_states,
+        is_varlen,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_smem_v,
+        use_packed_fma,
     )
     cache = _get_compiled_la_mtp_kernel(*cache_key)
 
@@ -930,7 +1072,12 @@ def linear_attention_decode_mtp(
             from_dlpack(s_offsets, assumed_align=16),
             from_dlpack(cu_seqlens, assumed_align=16),
             scale=softmax_scale,
-            B=B, T=T, H=H, HV=HV, K=K, V=V,
+            B=B,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
             tile_v=tile_v,
             vec_size=vec_size,
             ilp_rows=ilp_rows,
@@ -950,7 +1097,10 @@ def linear_attention_decode_mtp(
         h0_view,
         intermediate_states,
         decay_scales,
-        q, k, v, out,
+        q,
+        k,
+        v,
+        out,
         s_offsets,
         cu_seqlens,
         stream,

@@ -131,8 +131,6 @@ def la_verify_kvbuffer_kernel(
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
-    use_smem_v: cutlass.Constexpr[bool],  # vestigial: v always staged in SMEM now
-    use_packed_fma: cutlass.Constexpr[bool],  # vestigial: dot products now run on tensor cores
     write_kv: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -348,8 +346,6 @@ def run_la_verify_kvbuffer_kernel(
     tile_v: cutlass.Constexpr[int],
     vec_size: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
-    use_smem_v: cutlass.Constexpr[bool],
-    use_packed_fma: cutlass.Constexpr[bool],
     write_kv: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -389,8 +385,6 @@ def run_la_verify_kvbuffer_kernel(
         K,
         V,
         ilp_rows,
-        use_smem_v,
-        use_packed_fma,
         write_kv,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -413,8 +407,6 @@ def _get_compiled_verify_kvbuffer_kernel(
     tile_v: int,
     vec_size: int,
     ilp_rows: int,
-    use_smem_v: bool,
-    use_packed_fma: bool,
     write_kv: bool,
 ):
     return {}
@@ -468,7 +460,7 @@ def linear_attention_verify_kvbuffer(
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
-    tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, True)
+    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, True)
     assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
     assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     # The MMA tile has M=8 valid rows, so process 8 V-rows per warp per block:
@@ -476,8 +468,6 @@ def linear_attention_verify_kvbuffer(
     # number of row-blocks. Only applies when the V-rows-per-warp is a multiple of 8.
     if ilp_rows < 8 and (tile_v // 4) % 8 == 0:
         ilp_rows = 8
-    major, _ = get_device_sm_version(q.device)
-    use_packed_fma = major >= 10
 
     cache_key = (
         B,
@@ -491,8 +481,6 @@ def linear_attention_verify_kvbuffer(
         tile_v,
         vec_size,
         ilp_rows,
-        use_smem_v,
-        use_packed_fma,
         write_kv,
     )
     cache = _get_compiled_verify_kvbuffer_kernel(*cache_key)
@@ -529,8 +517,6 @@ def linear_attention_verify_kvbuffer(
             tile_v=tile_v,
             vec_size=vec_size,
             ilp_rows=ilp_rows,
-            use_smem_v=use_smem_v,
-            use_packed_fma=use_packed_fma,
             write_kv=write_kv,
             stream=stream,
             options="--enable-tvm-ffi",

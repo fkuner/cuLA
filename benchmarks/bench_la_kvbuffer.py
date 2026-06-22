@@ -445,7 +445,7 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
 
     # linear_attention_verify_kvbuffer dispatches by T: MMA kernel for T>=MMA_MIN_T,
     # shuffle kernel otherwise. Fetch the matching pre-compiled handle for timing.
-    tile_v_kv, vec_size_kv, ilp_rows_kv, use_smem_v_kv = get_mtp_config(B, T, HV, V, True)
+    tile_v_kv, vec_size_kv, ilp_rows_kv, _ = get_mtp_config(B, T, HV, V, True)
     if T >= MMA_MIN_T:
         # match the MMA kernel's ilp_rows=8 override (M=8 fragment fill)
         if ilp_rows_kv < 8 and (tile_v_kv // 4) % 8 == 0:
@@ -462,8 +462,6 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
             tile_v_kv,
             vec_size_kv,
             ilp_rows_kv,
-            use_smem_v_kv,
-            use_packed_fma,
             True,  # write_kv
         )
     else:

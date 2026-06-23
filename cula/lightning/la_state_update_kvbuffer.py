@@ -213,6 +213,75 @@ def _get_compiled_state_update_kernel(
     return {}
 
 
+def _state_update_compile_cache(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    *,
+    read_from_buf: bool,
+    device: torch.device,
+):
+    """Return (cache dict, tile config tuple) for the given launch parameters."""
+    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, False)
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
+    use_packed_fma = get_device_sm_version(device)[0] >= 10
+    cache = _get_compiled_state_update_kernel(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_packed_fma,
+        read_from_buf,
+    )
+    return cache, (tile_v, vec_size, ilp_rows, use_packed_fma)
+
+
+def get_compiled_state_update_kvbuffer_handle(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    *,
+    read_from_buf: bool,
+    device: torch.device,
+):
+    """Return a pre-compiled state-update kernel handle (benchmark kernel-only path).
+
+    Call ``linear_attention_state_update_kvbuffer`` once with the same config first.
+    """
+    cache, _ = _state_update_compile_cache(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        read_from_buf=read_from_buf,
+        device=device,
+    )
+    compiled = cache.get("compiled")
+    if compiled is None:
+        raise RuntimeError(
+            "State-update kernel not compiled for this config; "
+            "call linear_attention_state_update_kvbuffer once first."
+        )
+    return compiled
+
+
 def linear_attention_state_update_kvbuffer(
     k: torch.Tensor,  # [B, T, H,  K] bf16 — read when k_buf is None
     v: torch.Tensor,  # [B, T, HV, V] bf16 — read when v_buf is None
@@ -240,12 +309,7 @@ def linear_attention_state_update_kvbuffer(
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
-    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, False)
-    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
-    major, _ = get_device_sm_version(k.device)
-    use_packed_fma = major >= 10
-
-    cache_key = (
+    cache, (tile_v, vec_size, ilp_rows, use_packed_fma) = _state_update_compile_cache(
         B,
         T,
         H,
@@ -253,13 +317,9 @@ def linear_attention_state_update_kvbuffer(
         K,
         V,
         pool_size,
-        tile_v,
-        vec_size,
-        ilp_rows,
-        use_packed_fma,
-        read_from_buf,
+        read_from_buf=read_from_buf,
+        device=k.device,
     )
-    cache = _get_compiled_state_update_kernel(*cache_key)
 
     h0_view = s.view(pool_size * HV, V, K)
 

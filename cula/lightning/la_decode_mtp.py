@@ -439,6 +439,88 @@ def _get_compiled_la_mtp_kernel(
     return {}
 
 
+def _la_mtp_compile_cache(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    softmax_scale: float,
+    *,
+    disable_state_update: bool,
+    cache_intermediate_states: bool,
+    is_varlen: bool,
+    device: torch.device,
+):
+    """Return (cache dict, kernel config tuple) for the given launch parameters."""
+    tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
+    use_packed_fma = get_device_sm_version(device)[0] >= 10
+    cache = _get_compiled_la_mtp_kernel(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        softmax_scale,
+        disable_state_update,
+        cache_intermediate_states,
+        is_varlen,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_smem_v,
+        use_packed_fma,
+    )
+    return cache, (tile_v, vec_size, ilp_rows, use_smem_v, use_packed_fma)
+
+
+def get_compiled_la_mtp_handle(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    softmax_scale: float,
+    device: torch.device,
+    *,
+    disable_state_update: bool,
+    cache_intermediate_states: bool,
+    is_varlen: bool = False,
+):
+    """Return a pre-compiled MTP kernel handle (benchmark kernel-only path).
+
+    Call ``linear_attention_decode_mtp`` once with the same config first so the
+    cache entry is populated.
+    """
+    cache, _ = _la_mtp_compile_cache(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        softmax_scale,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
+        is_varlen=is_varlen,
+        device=device,
+    )
+    compiled = cache.get("compiled")
+    if compiled is None:
+        raise RuntimeError(
+            "MTP kernel not compiled for this config; call linear_attention_decode_mtp once first."
+        )
+    return compiled
+
+
 # ============================================================================
 # Public Python entry point
 # ============================================================================
@@ -483,12 +565,7 @@ def linear_attention_decode_mtp(
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
 
-    tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
-    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
-    major, _ = get_device_sm_version(q.device)
-    use_packed_fma = major >= 10
-
-    cache_key = (
+    cache, (tile_v, vec_size, ilp_rows, use_smem_v, use_packed_fma) = _la_mtp_compile_cache(
         B,
         T,
         H,
@@ -497,16 +574,11 @@ def linear_attention_decode_mtp(
         V,
         pool_size,
         softmax_scale,
-        disable_state_update,
-        cache_intermediate_states,
-        is_varlen,
-        tile_v,
-        vec_size,
-        ilp_rows,
-        use_smem_v,
-        use_packed_fma,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
+        is_varlen=is_varlen,
+        device=q.device,
     )
-    cache = _get_compiled_la_mtp_kernel(*cache_key)
 
     h0_view = s.view(pool_size * HV, V, K)
 

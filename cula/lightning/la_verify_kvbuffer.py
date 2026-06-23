@@ -18,7 +18,7 @@ Lightning Attention KVBuffer verify kernel (paper Eq. 7 for LA).
 Closed-form parallel verification — computes each draft step's output directly
 from (h0, k, v) without materializing the intermediate states:
 
-    o_t = alpha^{t+1} * (h0 @ q_t * scale)            <- "term1" (HQ)
+    o_t = alpha^{t+1} * (h0 @ q_t * scale)                       <- "term1" (HQ)
         + sum_{i=0..t} alpha^{t-i} * (q_t . k_i) * scale * v_i   <- "term2" (QK·V)
 
 The two dot-product GEMMs run on tensor cores via inline-PTX mma.sync.m16n8k8
@@ -418,6 +418,100 @@ def _get_compiled_verify_kvbuffer_kernel(
     return {}
 
 
+def _verify_kvbuffer_compile_cache(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    softmax_scale: float,
+    *,
+    write_kv: bool,
+    device: torch.device,
+):
+    """Return (cache dict, tile config) for the given launch parameters."""
+    if T < MMA_MIN_T:
+        tile_v, vec_size, ilp_rows, _ = get_mtp_config(B, T, HV, V, True)
+        assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
+        use_packed_fma = get_device_sm_version(device)[0] >= 10
+        cache = _get_compiled_verify_kvbuffer_kernel_shuffle(
+            B,
+            T,
+            H,
+            HV,
+            K,
+            V,
+            pool_size,
+            softmax_scale,
+            tile_v,
+            vec_size,
+            ilp_rows,
+            use_packed_fma,
+            write_kv,
+        )
+        return cache, (tile_v, vec_size, ilp_rows, use_packed_fma)
+
+    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, True)
+    assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
+    if ilp_rows < 8 and (tile_v // 4) % 8 == 0:
+        ilp_rows = 8
+    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
+    cache = _get_compiled_verify_kvbuffer_kernel(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        softmax_scale,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        write_kv,
+    )
+    return cache, (tile_v, vec_size, ilp_rows, None)
+
+
+def get_compiled_verify_kvbuffer_handle(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    pool_size: int,
+    softmax_scale: float,
+    *,
+    write_kv: bool,
+    device: torch.device,
+):
+    """Return a pre-compiled verify kernel handle (benchmark kernel-only path).
+
+    Call ``linear_attention_verify_kvbuffer`` once with the same config first.
+    """
+    cache, _ = _verify_kvbuffer_compile_cache(
+        B,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        softmax_scale,
+        write_kv=write_kv,
+        device=device,
+    )
+    compiled = cache.get("compiled")
+    if compiled is None:
+        raise RuntimeError(
+            "Verify kernel not compiled for this config; call linear_attention_verify_kvbuffer once first."
+        )
+    return compiled
+
+
 def linear_attention_verify_kvbuffer(
     q: torch.Tensor,  # [B, T, H,  K] bf16
     k: torch.Tensor,  # [B, T, H,  K] bf16
@@ -467,18 +561,7 @@ def linear_attention_verify_kvbuffer(
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
-    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, True)
-    assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
-    # The MMA tile has M=8 valid rows, so process 8 V-rows per warp per block:
-    # this fills the fragment (vs ilp_rows=4 wasting half the MMA) and halves the
-    # number of row-blocks. Only applies when the V-rows-per-warp is a multiple of 8.
-    if ilp_rows < 8 and (tile_v // 4) % 8 == 0:
-        ilp_rows = 8
-    # Re-check after the promotion above: a partial row-block (V not a multiple of
-    # the final ilp_rows) would be silently skipped by the kernel's bounds guard.
-    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
-
-    cache_key = (
+    cache, (tile_v, vec_size, ilp_rows, _) = _verify_kvbuffer_compile_cache(
         B,
         T,
         H,
@@ -487,12 +570,9 @@ def linear_attention_verify_kvbuffer(
         V,
         pool_size,
         softmax_scale,
-        tile_v,
-        vec_size,
-        ilp_rows,
-        write_kv,
+        write_kv=write_kv,
+        device=q.device,
     )
-    cache = _get_compiled_verify_kvbuffer_kernel(*cache_key)
 
     h0_view = s.view(pool_size * HV, V, K)
 
@@ -864,12 +944,7 @@ def linear_attention_verify_kvbuffer_shuffle(
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
 
-    tile_v, vec_size, ilp_rows, _ = get_mtp_config(B, T, HV, V, True)
-    assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
-    major, _ = get_device_sm_version(q.device)
-    use_packed_fma = major >= 10
-
-    cache_key = (
+    cache, (tile_v, vec_size, ilp_rows, use_packed_fma) = _verify_kvbuffer_compile_cache(
         B,
         T,
         H,
@@ -878,13 +953,9 @@ def linear_attention_verify_kvbuffer_shuffle(
         V,
         pool_size,
         softmax_scale,
-        tile_v,
-        vec_size,
-        ilp_rows,
-        use_packed_fma,
-        write_kv,
+        write_kv=write_kv,
+        device=q.device,
     )
-    cache = _get_compiled_verify_kvbuffer_kernel_shuffle(*cache_key)
 
     h0_view = s.view(pool_size * HV, V, K)
 

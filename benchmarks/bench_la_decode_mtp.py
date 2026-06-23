@@ -51,14 +51,10 @@ try:
 except ImportError:
     HAS_FLA = False
 
-from benchmarks.utils import benchmark_cuda_fn
-from cula.lightning.la_decode_mtp import (
-    _get_compiled_la_mtp_kernel,
-    get_mtp_config,
-    linear_attention_decode_mtp,
-)
+from benchmarks.utils import benchmark_cuda_fn, relative_rms_error
+from cula.lightning.la_decode_mtp import get_compiled_la_mtp_handle, linear_attention_decode_mtp
 from cula.ops.la_decode import linear_attention_decode
-from cula.utils import USE_FAST_MATH, get_device_sm_version
+from cula.utils import USE_FAST_MATH
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -88,24 +84,38 @@ def run_config(
     device = "cuda"
     dtype = torch.bfloat16
     scale = K**-0.5
+    pool_size = B
 
     # Per-head log decay (Lightning Attention formula)
     g_gamma = -(8 / H * (1 - layer_idx / num_layers)) * torch.arange(H, device=device, dtype=torch.float32)
     decay_scales = -g_gamma  # la_decode_mtp convention: exp(-decay_scales)
 
-    # ── Random inputs ──────────────────────────────────────────────────────
+    # =========================================================================
+    # Layer 1 — Inputs & buffers
+    # =========================================================================
     torch.manual_seed(42)
     q_4d = torch.randn(B, T, H, K, device=device, dtype=dtype)
     k_4d = torch.randn(B, T, H, K, device=device, dtype=dtype)
     v_4d = torch.randn(B, T, HV, V, device=device, dtype=dtype)
     state_init = torch.randn(B, HV, K, V, device=device, dtype=torch.float32) * 0.01  # K-major
 
-    # ── fla reference output ───────────────────────────────────────────────
+    s_offsets = torch.arange(B, device=device, dtype=torch.int32)
+    cu_seqlens_dummy = torch.empty(1, device=device, dtype=torch.int32)
+    inter = (
+        torch.zeros(B * T * HV, V, K, device=device, dtype=torch.float32)
+        if cache_intermediate_states
+        else torch.empty(1, 1, 1, device=device, dtype=torch.float32)
+    )
+
+    # =========================================================================
+    # Layer 2 — Correctness + compile warmup (wrapper, same config as benchmark)
+    # =========================================================================
+    # fla reference
     o_fla = None
     if HAS_FLA:
         state_fla = state_init.clone()
         with torch.no_grad():
-            o_fla_fp32, ht_fla = fused_recurrent_fwd(
+            o_fla_fp32, _ht_fla = fused_recurrent_fwd(
                 q_4d,
                 k_4d,
                 v_4d,
@@ -114,18 +124,11 @@ def run_config(
                 initial_state=state_fla,
                 output_final_state=True,
             )
-        o_fla = o_fla_fp32.to(dtype)  # [B, T, H, V] (fla expects HV==H)
+        o_fla = o_fla_fp32.to(dtype)
 
-    # ── cula MTP ───────────────────────────────────────────────────────────
+    # cuLA MTP — also populates the compile cache for kernel-only timing below
     s_cute = state_init.clone().permute(0, 1, 3, 2).contiguous()  # [B, HV, V, K]
     out_cute = torch.zeros(B, T, HV, V, device=device, dtype=dtype)
-    s_offsets = torch.arange(B, device=device, dtype=torch.int32)
-    inter = torch.empty(1, 1, 1, device=device, dtype=torch.float32)  # dummy
-    cu_seqlens_dummy = torch.empty(1, device=device, dtype=torch.int32)
-
-    if cache_intermediate_states:
-        inter = torch.zeros(B * T * HV, V, K, device=device, dtype=torch.float32)
-
     with torch.no_grad():
         linear_attention_decode_mtp(
             q_4d,
@@ -144,20 +147,18 @@ def run_config(
             is_varlen=False,
         )
 
-    # ── Correctness vs fla ─────────────────────────────────────────────────
-    rmse, rel_maxdiff = float("nan"), float("nan")
+    rmse = rel_maxdiff = float("nan")
     if o_fla is not None and HV == H:
-        out_cmp = out_cute.float()
+        rmse = relative_rms_error(o_fla.float(), out_cute.float())
         ref_cmp = o_fla.float()
-        rmse = torch.sqrt(torch.mean((out_cmp - ref_cmp) ** 2)).item()
+        out_cmp = out_cute.float()
         max_ref = torch.abs(ref_cmp).max().item()
         rel_maxdiff = torch.abs(out_cmp - ref_cmp).max().item() / (max_ref + 1e-8)
 
-    # ==================================================================
-    # Mode 1: KERNEL-ONLY — pre-allocated, pre-compiled, pre-built stream
-    # ==================================================================
-    pool_size = B
-    cache_key = (
+    # =========================================================================
+    # Layer 3a — Kernel-only timing (compiled handle + pre-built stream)
+    # =========================================================================
+    compiled_cute = get_compiled_la_mtp_handle(
         B,
         T,
         H,
@@ -166,19 +167,16 @@ def run_config(
         V,
         pool_size,
         scale,
-        disable_state_update,
-        cache_intermediate_states,
-        False,
-        *get_mtp_config(B, T, HV, V, disable_state_update),
-        get_device_sm_version(q_4d.device)[0] >= 10,
+        q_4d.device,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
+        is_varlen=False,
     )
-    cute_cache = _get_compiled_la_mtp_kernel(*cache_key)
-    compiled_cute = cute_cache["compiled"]
     stream_handle = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
     state_kk = state_init.clone().permute(0, 1, 3, 2).contiguous().view(pool_size * HV, V, K)
     out_kk = torch.empty(B, T, HV, V, device=device, dtype=dtype)
-    inter_kk = inter if cache_intermediate_states else torch.empty(1, 1, 1, device=device, dtype=torch.float32)
+    inter_kk = inter
 
     def kernel_cute_mtp():
         compiled_cute(
@@ -194,7 +192,7 @@ def run_config(
             stream_handle,
         )
 
-    # cula T-sequential baseline: T calls to la_decode (T=1 each)
+    # cula self-baseline: T sequential la_decode (T=1) wrapper calls
     state_seq = state_init.clone().permute(0, 1, 3, 2).contiguous().view(B * HV, V, K)
     out_seq_buf = torch.empty(B, HV, V, device=device, dtype=dtype)
     q_slices = [q_4d[:, t].contiguous() for t in range(T)]
@@ -222,14 +220,13 @@ def run_config(
                 V_SPLIT_DIM=V,
             )
 
-    # fla kernel-only mode would require careful pre-allocation; use wrapper for fla.
     with torch.no_grad():
         cute_mtp_ms = benchmark_cuda_fn(kernel_cute_mtp)
         cute_seq_ms = benchmark_cuda_fn(kernel_cute_seq)
 
-    # ==================================================================
-    # Mode 2: WRAPPER — full Python entry path (cache lookup + CUstream per call)
-    # ==================================================================
+    # =========================================================================
+    # Layer 3b — Wrapper timing (full Python entry path per call)
+    # =========================================================================
     s_wrap = state_init.clone().permute(0, 1, 3, 2).contiguous()
     out_wrap = torch.empty(B, T, HV, V, device=device, dtype=dtype)
     inter_wrap = (
@@ -259,7 +256,6 @@ def run_config(
     with torch.no_grad():
         wrap_cute_ms = benchmark_cuda_fn(wrapper_cute_mtp)
 
-    # fla wrapper
     fla_ms = float("nan")
     if HAS_FLA:
         state_fla_bench = state_init.clone()
@@ -278,7 +274,9 @@ def run_config(
         with torch.no_grad():
             fla_ms = benchmark_cuda_fn(wrapper_fla)
 
-    # ── Roofline ────────────────────────────────────────────────────────
+    # =========================================================================
+    # Layer 4 — Roofline & summary
+    # =========================================================================
     bytes_moved = la_mtp_bytes(
         B,
         T,
@@ -291,9 +289,6 @@ def run_config(
     )
     sol = sol_pct(bytes_moved, cute_mtp_ms, peak_bps)
 
-    speedup_seq = cute_seq_ms / cute_mtp_ms
-    speedup_fla = fla_ms / cute_mtp_ms if HAS_FLA else float("nan")
-
     return {
         "B": B,
         "T": T,
@@ -301,8 +296,8 @@ def run_config(
         "cute_seq_ms": cute_seq_ms,
         "fla_ms": fla_ms,
         "wrap_cute_ms": wrap_cute_ms,
-        "speedup_seq": speedup_seq,
-        "speedup_fla": speedup_fla,
+        "speedup_seq": cute_seq_ms / cute_mtp_ms,
+        "speedup_fla": fla_ms / cute_mtp_ms if HAS_FLA else float("nan"),
         "rmse": rmse,
         "rel_maxdiff": rel_maxdiff,
         "sol_pct": sol,
@@ -337,7 +332,7 @@ def main():
     print(f"  cache_intermediate_states={args.cache_intermediate}, disable_state_update={args.disable_state_update}")
     print(f"  USE_FAST_MATH={USE_FAST_MATH}, fla available={HAS_FLA}")
 
-    fla_avail = HAS_FLA and HV == H  # fla expects HV == H
+    fla_avail = HAS_FLA and HV == H
     if HAS_FLA and HV != H:
         print(f"  [warning] GQA HV={HV} != H={H}; fla baseline disabled (fla assumes HV==H)")
 

@@ -58,6 +58,7 @@ try:
 except Exception as e:  # noqa: BLE001 — any import failure → run without SGLang
     _HAVE_SGLANG, _SGLANG_ERR = False, repr(e)
 
+from benchmarks.utils import benchmark_cuda_fn  # noqa: E402
 from cula.lightning.la_decode_mtp import (  # noqa: E402
     get_mtp_config,
     linear_attention_decode_mtp,
@@ -204,28 +205,6 @@ def run_sglang_commit(s_sglang, caches_sglang, s_offsets, step_indices, B, H, K,
     dst = s_sglang.reshape(1, -1, elem_per_entry)
     src = caches_sglang.reshape(1, B, T, elem_per_entry)
     fused_mamba_state_scatter_with_mask(dst, src, s_offsets, step_indices)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Timing utility
-# ─────────────────────────────────────────────────────────────────────────────
-def benchmark_fn(fn, warmup=30, rep=200):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    for i in range(rep):
-        starts[i].record()
-        fn()
-        ends[i].record()
-    torch.cuda.synchronize()
-
-    times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
-    n = len(times)
-    iqr = times[n // 4 : 3 * n // 4]
-    return sum(iqr) / len(iqr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -548,11 +527,11 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
         )
 
     with torch.no_grad():
-        cu_vfy_ms = benchmark_fn(kernel_kvbuf_verify_with_write)
-        cu_cmt_ms = benchmark_fn(kernel_kvbuf_update_from_buf)
+        cu_vfy_ms = benchmark_cuda_fn(kernel_kvbuf_verify_with_write)
+        cu_cmt_ms = benchmark_cuda_fn(kernel_kvbuf_update_from_buf)
         if _HAVE_SGLANG:
-            sg_vfy_ms = benchmark_fn(kernel_sglang)
-            sg_cmt_ms = benchmark_fn(kernel_sglang_commit)
+            sg_vfy_ms = benchmark_cuda_fn(kernel_sglang)
+            sg_cmt_ms = benchmark_cuda_fn(kernel_sglang_commit)
         else:
             sg_vfy_ms = sg_cmt_ms = float("nan")
 

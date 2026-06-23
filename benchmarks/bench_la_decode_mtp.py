@@ -51,6 +51,7 @@ try:
 except ImportError:
     HAS_FLA = False
 
+from benchmarks.utils import benchmark_cuda_fn
 from cula.lightning.la_decode_mtp import (
     _get_compiled_la_mtp_kernel,
     get_mtp_config,
@@ -58,29 +59,6 @@ from cula.lightning.la_decode_mtp import (
 )
 from cula.ops.la_decode import linear_attention_decode
 from cula.utils import USE_FAST_MATH, get_device_sm_version
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Timing utility
-# ─────────────────────────────────────────────────────────────────────────────
-def benchmark_fn(fn, warmup=30, rep=200):
-    """CUDA-event timing with IQR-mean (drops outliers)."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-
-    starts = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    ends = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    for i in range(rep):
-        starts[i].record()
-        fn()
-        ends[i].record()
-    torch.cuda.synchronize()
-
-    times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
-    n = len(times)
-    iqr = times[n // 4 : 3 * n // 4]
-    return sum(iqr) / len(iqr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,8 +224,8 @@ def run_config(
 
     # fla kernel-only mode would require careful pre-allocation; use wrapper for fla.
     with torch.no_grad():
-        cute_mtp_ms = benchmark_fn(kernel_cute_mtp)
-        cute_seq_ms = benchmark_fn(kernel_cute_seq)
+        cute_mtp_ms = benchmark_cuda_fn(kernel_cute_mtp)
+        cute_seq_ms = benchmark_cuda_fn(kernel_cute_seq)
 
     # ==================================================================
     # Mode 2: WRAPPER — full Python entry path (cache lookup + CUstream per call)
@@ -279,7 +257,7 @@ def run_config(
         )
 
     with torch.no_grad():
-        wrap_cute_ms = benchmark_fn(wrapper_cute_mtp)
+        wrap_cute_ms = benchmark_cuda_fn(wrapper_cute_mtp)
 
     # fla wrapper
     fla_ms = float("nan")
@@ -298,7 +276,7 @@ def run_config(
             )
 
         with torch.no_grad():
-            fla_ms = benchmark_fn(wrapper_fla)
+            fla_ms = benchmark_cuda_fn(wrapper_fla)
 
     # ── Roofline ────────────────────────────────────────────────────────
     bytes_moved = la_mtp_bytes(

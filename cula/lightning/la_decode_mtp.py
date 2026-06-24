@@ -85,40 +85,38 @@ def hq_dot_pair(h_lo, h_hi, q_lo, q_hi, sum_lo, sum_hi, use_packed_fma: cutlass.
         return h_lo * q_lo + sum_lo, h_hi * q_hi + sum_hi
 
 
-# TODO: re-tune for LA after first benchmark.
 # TODO (perf): for configs with row_iters > 1 (e.g. tile_v=64, ilp=4), q/k are
 # reloaded from global on every row-loop iteration because the row-outer / T-inner
 # structure is required to keep h register-resident across T (r_h budget is 8 rows).
 # Stage q/k in SMEM per i_t (cooperative load + barrier) to avoid the (row_iters - 1)
 # redundant reads; worst case (tile_v=64, ilp=4) wastes 3x the q/k bandwidth.
+# With the LA-tuned thresholds (tile_v <= 32), row_iters <= 2, so this is less
+# urgent, but still worth doing for ilp=2 with larger tile_v.
 def get_mtp_config(B: int, T: int, HV: int, V: int, disable_state_update: bool) -> tuple:
-    """Pick (tile_v, vec_size, ilp_rows, use_smem_v) based on work units.
+    """Pick (tile_v, vec_size, ilp_rows) for the decode kernel based on work units.
 
-    Thresholds ported from GDN MTP (B200 grid search on Qwen3.5, HV=64).
-    LA's per-step compute is ~30% lighter (no delta rule), so we may need
-    to retune; the structure is preserved for now.
+    LA grid search on B200 (H=HV=64, K=V=128) with B ∈ [1..128], T ∈ [2,4,8].
+    LA's per-step compute is ~30% lighter than GDN (no delta rule), so the
+    compute/memory ratio is lower — favouring smaller tiles with more blocks
+    to improve occupancy and amortize per-block overhead.
+
+    The old GDN-derived thresholds (tile_v=64, ilp=4 for work_units > 1024) are
+    suboptimal for LA by 3-12% at medium-to-large B.  ``use_smem_v`` was dropped:
+    v has no cross-row reuse in LA, so SMEM staging only added a barrier (grid
+    search confirmed the direct-global path wins for every tile config).
+
+    ``disable_state_update`` is kept in the signature for API stability but no
+    longer affects the tile choice (the old state-update branch collapsed).
     """
     work_units = B * HV
     vec_size = 4
 
-    if work_units <= 64:
-        tile_v, ilp_rows, use_smem_v = 8, 2, False
-    elif work_units <= 128:
-        tile_v, ilp_rows, use_smem_v = 16, 4, False
-    elif work_units <= 448:
-        if T <= 2:
-            tile_v, ilp_rows, use_smem_v = 16, 2, False
-        else:
-            tile_v, ilp_rows, use_smem_v = 32, 4, False
+    if work_units <= 256:
+        tile_v, ilp_rows = 32, 8
     elif work_units <= 1024:
-        tile_v, ilp_rows, use_smem_v = 32, 4, False
+        tile_v, ilp_rows = 16, 4
     else:
-        tile_v = 64
-        use_smem_v = True
-        ilp_rows = 4
-        if not disable_state_update and T <= 2:
-            ilp_rows = 8
-            use_smem_v = False
+        tile_v, ilp_rows = 8, 2
 
     tile_v = min(tile_v, V)
     rows_per_group = tile_v // 4
@@ -126,7 +124,7 @@ def get_mtp_config(B: int, T: int, HV: int, V: int, disable_state_update: bool) 
         f"tile_v={tile_v} / num_groups=4 / ilp_rows={ilp_rows} doesn't divide cleanly "
         f"(rows_per_group={rows_per_group}); the ILP loop would run zero iterations."
     )
-    return tile_v, vec_size, ilp_rows, use_smem_v
+    return tile_v, vec_size, ilp_rows
 
 
 # ============================================================================
@@ -157,7 +155,6 @@ def la_verify_kernel_mtp(
     cache_intermediate_states: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
-    use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -183,14 +180,9 @@ def la_verify_kernel_mtp(
     cache_idx = h0_indices[i_n]
 
     # ------------------------------------------------------------------
-    # SMEM allocation (sVdata + sOutput only — LA has no Phase 1 work)
-    # ------------------------------------------------------------------
-    smem = cutlass.utils.SmemAllocator()
-    sVdata = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
-    sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
-
-    # ------------------------------------------------------------------
-    # Register tensors
+    # Register tensors (LA decode is memory-bound — no SMEM staging; v has no
+    # cross-row reuse so staging it would only add a barrier. Grid search
+    # confirmed the direct-global path wins for every tile config.)
     # ------------------------------------------------------------------
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
@@ -202,16 +194,6 @@ def la_verify_kernel_mtp(
     if cache_idx >= 0:
         # r_decay is a T-loop invariant — computed ONCE.
         r_decay = cute.exp(-cutlass.Float32(decay_scales[i_h]), fastmath=USE_FAST_MATH)
-
-        # Optional v preload to SMEM (cooperative load across the whole block).
-        if cutlass.const_expr(use_smem_v):
-            for i_t in cutlass.range_constexpr(T):
-                v_tile_start = i_v * tile_v
-                if tidx < tile_v:
-                    v_global_idx = v_tile_start + tidx
-                    if v_global_idx < V:
-                        sVdata[(i_t, tidx)] = cutlass.Float32(v[i_n, i_t, i_hv, v_global_idx])
-            cute.arch.barrier()
 
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv
@@ -260,10 +242,7 @@ def la_verify_kernel_mtp(
 
                     # ---- fused decay + rank-1 update (per V-row) ----
                     for slot in cutlass.range_constexpr(ilp_rows):
-                        if cutlass.const_expr(use_smem_v):
-                            r_v_s = sVdata[(i_t, v_idx_0 - i_v * tile_v + slot)]
-                        else:
-                            r_v_s = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_0 + slot])
+                        r_v_s = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_0 + slot])
                         for j in cutlass.range_constexpr(0, vec_size, 2):
                             r_h[slot, j], r_h[slot, j + 1] = la_update_pair(
                                 r_h[slot, j],
@@ -305,13 +284,8 @@ def la_verify_kernel_mtp(
 
                     # ---- writeback ----
                     if lane_in_group == 0:
-                        if cutlass.const_expr(use_smem_v):
-                            vla = v_idx_0 - i_v * tile_v
-                            for slot in cutlass.range_constexpr(ilp_rows):
-                                sOutput[(i_t, vla + slot)] = cutlass.BFloat16(r_dot_lo[slot])
-                        else:
-                            for slot in cutlass.range_constexpr(ilp_rows):
-                                o[(i_n, i_t, i_hv, v_idx_0 + slot)] = cutlass.BFloat16(r_dot_lo[slot])
+                        for slot in cutlass.range_constexpr(ilp_rows):
+                            o[(i_n, i_t, i_hv, v_idx_0 + slot)] = cutlass.BFloat16(r_dot_lo[slot])
 
                 # Final state writeback
                 if cutlass.const_expr(not disable_state_update):
@@ -322,16 +296,6 @@ def la_verify_kernel_mtp(
                             (flat_state_idx, v_idx_0 + slot, lane_in_group),
                         )
                         cute.autovec_copy(cute.slice_(r_h, (slot, None)), h_tile_out)
-
-        # Cooperative output writeback (only when use_smem_v staged outputs to SMEM)
-        if cutlass.const_expr(use_smem_v):
-            cute.arch.barrier()
-            v_tile_base = i_v * tile_v
-            for t_idx in cutlass.range_constexpr(T):
-                if tidx < tile_v:
-                    v_global = v_tile_base + tidx
-                    if v_global < V:
-                        o[(i_n, t_idx, i_hv, v_global)] = sOutput[(t_idx, tidx)]
 
 
 # ============================================================================
@@ -358,7 +322,6 @@ def run_la_verify_kernel_mtp(
     tile_v: cutlass.Constexpr[int],
     vec_size: cutlass.Constexpr[int],
     ilp_rows: cutlass.Constexpr[int],
-    use_smem_v: cutlass.Constexpr[bool],
     use_packed_fma: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
@@ -374,11 +337,9 @@ def run_la_verify_kernel_mtp(
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
     grid_size = B * HV * num_v_tiles
 
-    smem_bytes = (
-        4 * T * tile_v  # sVdata
-        + 2 * T * tile_v  # sOutput
-        + 128  # alignment
-    )
+    # LA decode uses no SMEM (v has no cross-row reuse; grid search confirmed the
+    # direct-global path wins). Reserve a small alignment slack only.
+    smem_bytes = 128
 
     la_verify_kernel_mtp(
         h0_source,
@@ -404,7 +365,6 @@ def run_la_verify_kernel_mtp(
         cache_intermediate_states,
         is_varlen,
         ilp_rows,
-        use_smem_v,
         use_packed_fma,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -433,7 +393,6 @@ def _get_compiled_la_mtp_kernel(
     tile_v: int,
     vec_size: int,
     ilp_rows: int,
-    use_smem_v: bool,
     use_packed_fma: bool,
 ):
     return {}
@@ -455,7 +414,7 @@ def _la_mtp_compile_cache(
     device: torch.device,
 ):
     """Return (cache dict, kernel config tuple) for the given launch parameters."""
-    tile_v, vec_size, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
+    tile_v, vec_size, ilp_rows = get_mtp_config(B, T, HV, V, disable_state_update)
     assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     use_packed_fma = get_device_sm_version(device)[0] >= 10
     cache = _get_compiled_la_mtp_kernel(
@@ -473,10 +432,9 @@ def _la_mtp_compile_cache(
         tile_v,
         vec_size,
         ilp_rows,
-        use_smem_v,
         use_packed_fma,
     )
-    return cache, (tile_v, vec_size, ilp_rows, use_smem_v, use_packed_fma)
+    return cache, (tile_v, vec_size, ilp_rows, use_packed_fma)
 
 
 def get_compiled_la_mtp_handle(
@@ -515,9 +473,7 @@ def get_compiled_la_mtp_handle(
     )
     compiled = cache.get("compiled")
     if compiled is None:
-        raise RuntimeError(
-            "MTP kernel not compiled for this config; call linear_attention_decode_mtp once first."
-        )
+        raise RuntimeError("MTP kernel not compiled for this config; call linear_attention_decode_mtp once first.")
     return compiled
 
 
@@ -565,7 +521,7 @@ def linear_attention_decode_mtp(
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
 
-    cache, (tile_v, vec_size, ilp_rows, use_smem_v, use_packed_fma) = _la_mtp_compile_cache(
+    cache, (tile_v, vec_size, ilp_rows, use_packed_fma) = _la_mtp_compile_cache(
         B,
         T,
         H,
@@ -606,7 +562,6 @@ def linear_attention_decode_mtp(
             tile_v=tile_v,
             vec_size=vec_size,
             ilp_rows=ilp_rows,
-            use_smem_v=use_smem_v,
             use_packed_fma=use_packed_fma,
             disable_state_update=disable_state_update,
             cache_intermediate_states=cache_intermediate_states,

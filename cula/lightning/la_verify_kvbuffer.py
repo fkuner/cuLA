@@ -57,7 +57,6 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 from cula.lightning.la_decode_mtp import (
     NUM_THREADS_MTP,
-    get_mtp_config,
     hq_dot_pair,
 )
 from cula.utils import USE_FAST_MATH, get_device_sm_version
@@ -68,6 +67,41 @@ from cula.utils import USE_FAST_MATH, get_device_sm_version
 # GEMMs are under-utilised and its larger SMEM footprint caps occupancy.
 # See docs/la_verify_kvbuffer_dev_history.md §6 for the full benchmark.
 MMA_MIN_T: int = 4
+
+
+def get_mtp_config(B: int, T: int, HV: int, V: int) -> tuple:
+    """Pick (tile_v, vec_size, ilp_rows) for the verify + state-update kernels.
+
+    Grid-searched on the LA verify kernel (B200, H=HV=64, K=V=128,
+    B ∈ [1..128], T ∈ [2,4,8]).  This is the *opposite* regime from the decode
+    kernel's ``get_mtp_config``: the verify kernel runs tensor-core MMA GEMMs
+    (T>=4) and is compute-bound, so it wants LARGE tiles with ilp_rows=8 — more
+    V-rows per block amortize the q/k SMEM staging and fill the m16n8k8 MMA
+    tiles.  Small tiles starve the tensor cores (75% output padding at tile_v=8).
+
+    vs the old shared GDN thresholds (tile_v=64, ilp=4 for work_units>1024):
+    up to 1.6x faster on the MMA path at large B (e.g. B=128,T=4: 0.170→0.125 ms;
+    B=1024,T=4: 0.031→0.019 ms).  At small work_units the kernel is
+    latency-bound, so the tile choice is immaterial (<2% spread).
+
+    Returns a 3-tuple — the verify/state-update kernels have no ``use_smem_v``
+    knob (they always stage v in SMEM).
+    """
+    work_units = B * HV
+    vec_size = 4
+    if work_units <= 512:
+        tile_v, ilp_rows = 64, 8
+    else:
+        tile_v, ilp_rows = 128, 8
+
+    tile_v = min(tile_v, V)
+    rows_per_group = tile_v // 4
+    assert rows_per_group % ilp_rows == 0, (
+        f"tile_v={tile_v} / num_groups=4 / ilp_rows={ilp_rows} doesn't divide cleanly "
+        f"(rows_per_group={rows_per_group}); the ILP loop would run zero iterations."
+    )
+    return tile_v, vec_size, ilp_rows
+
 
 # ---------------------------------------------------------------------------
 # Inline PTX mma.sync.m16n8k8.tf32 — copied from kda_decode_mtp_kvbuffer.py
@@ -433,7 +467,7 @@ def _verify_kvbuffer_compile_cache(
 ):
     """Return (cache dict, tile config) for the given launch parameters."""
     if T < MMA_MIN_T:
-        tile_v, vec_size, ilp_rows, _ = get_mtp_config(B, T, HV, V, True)
+        tile_v, vec_size, ilp_rows = get_mtp_config(B, T, HV, V)
         assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
         use_packed_fma = get_device_sm_version(device)[0] >= 10
         cache = _get_compiled_verify_kvbuffer_kernel_shuffle(
@@ -453,10 +487,8 @@ def _verify_kvbuffer_compile_cache(
         )
         return cache, (tile_v, vec_size, ilp_rows, use_packed_fma)
 
-    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, True)
+    tile_v, vec_size, ilp_rows = get_mtp_config(B, T, HV, V)
     assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
-    if ilp_rows < 8 and (tile_v // 4) % 8 == 0:
-        ilp_rows = 8
     assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     cache = _get_compiled_verify_kvbuffer_kernel(
         B,
@@ -506,9 +538,7 @@ def get_compiled_verify_kvbuffer_handle(
     )
     compiled = cache.get("compiled")
     if compiled is None:
-        raise RuntimeError(
-            "Verify kernel not compiled for this config; call linear_attention_verify_kvbuffer once first."
-        )
+        raise RuntimeError("Verify kernel not compiled for this config; call linear_attention_verify_kvbuffer once first.")
     return compiled
 
 

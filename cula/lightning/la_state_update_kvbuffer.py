@@ -42,9 +42,9 @@ from cutlass.cute.runtime import from_dlpack
 
 from cula.lightning.la_decode_mtp import (
     NUM_THREADS_MTP,
-    get_mtp_config,
     la_update_pair,
 )
+from cula.lightning.la_verify_kvbuffer import get_mtp_config
 from cula.utils import USE_FAST_MATH, get_device_sm_version
 
 
@@ -226,7 +226,7 @@ def _state_update_compile_cache(
     device: torch.device,
 ):
     """Return (cache dict, tile config tuple) for the given launch parameters."""
-    tile_v, vec_size, ilp_rows, _use_smem_v = get_mtp_config(B, T, HV, V, False)
+    tile_v, vec_size, ilp_rows = get_mtp_config(B, T, HV, V)
     assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     use_packed_fma = get_device_sm_version(device)[0] >= 10
     cache = _get_compiled_state_update_kernel(
@@ -276,8 +276,7 @@ def get_compiled_state_update_kvbuffer_handle(
     compiled = cache.get("compiled")
     if compiled is None:
         raise RuntimeError(
-            "State-update kernel not compiled for this config; "
-            "call linear_attention_state_update_kvbuffer once first."
+            "State-update kernel not compiled for this config; call linear_attention_state_update_kvbuffer once first."
         )
     return compiled
 

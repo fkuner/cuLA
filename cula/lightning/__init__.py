@@ -18,8 +18,8 @@ from cula.lightning.la_state_update_kvbuffer import (
     linear_attention_state_update_kvbuffer_fused,
 )
 from cula.lightning.la_verify_kvbuffer import linear_attention_verify_kvbuffer
-from cula.ops.la_decode import linear_attention_decode
-from cula.ops.lightning_attn_sm100 import (
+from cula.ops.lightning.decode import linear_attention_decode
+from cula.ops.lightning.prefill_sm100 import (
     LinearAttentionChunkwiseDecay,
     lightning_attn_fwd,
     lightning_attn_fwd_varlen,

@@ -53,7 +53,7 @@ except ImportError:
 
 from benchmarks.utils import benchmark_cuda_fn, relative_rms_error
 from cula.lightning.la_decode_mtp import get_compiled_la_mtp_handle, linear_attention_decode_mtp
-from cula.ops.la_decode import linear_attention_decode
+from cula.ops.lightning.decode import linear_attention_decode
 from cula.utils import USE_FAST_MATH
 
 

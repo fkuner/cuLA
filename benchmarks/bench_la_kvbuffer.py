@@ -173,7 +173,8 @@ def run_sglang_commit(s_sglang, caches_sglang, s_offsets, step_indices, B, H, K,
 # ─────────────────────────────────────────────────────────────────────────────
 def run_config(B, T, H, K, V, layer_idx, num_layers):
     device = "cuda"
-    dtype = torch.bfloat16
+    input_dtype = torch.float32
+    out_dtype = torch.float32
     scale = K**-0.5
     HV = H  # SGLang seg_la does not support GQA
     pool_size = B
@@ -182,26 +183,26 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
     decay_scales = -g_gamma
 
     # =========================================================================
-    # Layer 1 — Inputs & buffers (benchmark config: write_kv + read_from_buf)
+    # Layer 1 — Inputs & buffers (benchmark config: verify writes k/v, commit reads k/v buffers)
     # =========================================================================
     torch.manual_seed(42)
-    q_4d = torch.randn(B, T, H, K, device=device, dtype=dtype)
-    k_4d = torch.randn(B, T, H, K, device=device, dtype=dtype)
-    v_4d = torch.randn(B, T, HV, V, device=device, dtype=dtype)
+    q_4d = torch.randn(B, T, H, K, device=device, dtype=input_dtype)
+    k_4d = torch.randn(B, T, H, K, device=device, dtype=input_dtype)
+    v_4d = torch.randn(B, T, HV, V, device=device, dtype=input_dtype)
     state_init = torch.randn(B, H, K, V, device=device, dtype=torch.float32) * 0.01  # K-major
 
     # cuLA state pool [pool_size, HV, V, K]
     s_kvbuf = state_init.permute(0, 1, 3, 2).contiguous()
     s_kk_view = s_kvbuf.view(pool_size * HV, V, K)
 
-    out_kvbuf = torch.zeros(B, T, HV, V, device=device, dtype=dtype)
-    out_kk = torch.empty(B, T, HV, V, device=device, dtype=dtype)
+    out_kvbuf = torch.zeros(B, T, HV, V, device=device, dtype=out_dtype)
+    out_kk = torch.empty(B, T, HV, V, device=device, dtype=out_dtype)
 
     h0_indices = torch.arange(B, device=device, dtype=torch.int32)
     accepted_len = torch.full((B,), T, device=device, dtype=torch.int32)
 
-    k_buf = torch.zeros(pool_size, T, H, K, device=device, dtype=dtype)
-    v_buf = torch.zeros(pool_size, T, HV, V, device=device, dtype=dtype)
+    k_buf = torch.zeros(pool_size, T, H, K, device=device, dtype=torch.float32)
+    v_buf = torch.zeros(pool_size, T, HV, V, device=device, dtype=torch.float32)
 
     # SGLang 3D views (length = B*T)
     q_3d = q_4d.reshape(B * T, H, K).contiguous()
@@ -228,15 +229,13 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
             v_buf=v_buf,
         )
         linear_attention_state_update_kvbuffer(
-            k_4d,
-            v_4d,
+            k_buf,
+            v_buf,
             s_kvbuf,
             decay_scales,
             h0_indices,
             accepted_len,
             T,
-            k_buf=k_buf,
-            v_buf=v_buf,
         )
 
     rmse_kv = relative_rms_error(o_ref, out_kvbuf.float())
@@ -287,7 +286,7 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
         B, T, H, HV, K, V, pool_size, scale, write_kv=True, device=q_4d.device
     )
     compiled_update = get_compiled_state_update_kvbuffer_handle(
-        B, T, H, HV, K, V, pool_size, read_from_buf=True, device=q_4d.device
+        B, T, H, HV, K, V, pool_size, device=q_4d.device
     )
 
     def kernel_kvbuf_verify():
@@ -308,8 +307,6 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
         compiled_update(
             s_kk_view,
             decay_scales,
-            k_4d,
-            v_4d,
             h0_indices,
             accepted_len,
             k_buf,
@@ -398,7 +395,7 @@ def main():
 
     print("LA KVBuffer verify + state-update benchmark (cuLA, optional SGLang baseline)")
     print(f"  H={H}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
-    print("  dtype=bf16, state=fp32")
+    print("  q/k/v=fp32, out=fp32, state=fp32, kv_buffer=fp32")
     print(f"  USE_FAST_MATH={USE_FAST_MATH}")
     print("  Timing: kernel-only (wrapper for compile warmup; compiled handle for measure)")
     if _HAVE_SGLANG:
@@ -429,7 +426,7 @@ def main():
         print()
 
     sg_mem = B * T_val * H * K * V * 4
-    cu_mem = B * T_val * (H * K + H * V) * 2
+    cu_mem = B * T_val * (H * K + H * V) * 4
     print(f"Memory per-pool (B={args.batch_sizes[-1]}, T={args.T[-1]}):")
     print(f"  SGLang intermediate caches: {sg_mem / 1e6:.1f} MB")
     print(f"  cuLA KV buffer:             {cu_mem / 1e6:.1f} MB")

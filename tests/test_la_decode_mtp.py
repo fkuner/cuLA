@@ -20,11 +20,11 @@ Compares against a PyTorch reference implementation of multi-token
 Lightning Attention decode (T > 1).
 
 Layouts:
-  q, k:                [B, T, H,  K]   bf16
-  v:                   [B, T, HV, V]   bf16
+  q, k:                [B, T, H,  K]   fp32
+  v:                   [B, T, HV, V]   fp32
   s:                   [pool_size, HV, V, K]  fp32  (V-major, K-last)
   intermediate_states: [pool_size * T * HV, V, K] fp32, or 1-elem dummy
-  out:                 [B, T, HV, V]   bf16
+  out:                 [B, T, HV, V]   fp32
   decay_scales:        [H]             fp32  (positive; kernel does exp(-x))
   s_offsets:           [B]             int32 (pool index per batch; -1 to skip)
 """
@@ -48,8 +48,8 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
     """Pure PyTorch reference.
 
     Args:
-        q, k:        [B, T, H,  D] bf16
-        v:           [B, T, HV, D] bf16
+        q, k:        [B, T, H,  D] fp32
+        v:           [B, T, HV, D] fp32
         state:       [B, HV, D, D] fp32 (K-major, V-minor)
         decay_scales: [H] fp32 (positive; kernel does exp(-x))
         scale: float
@@ -58,7 +58,7 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
         disable_state_update: do not update state_new at end
 
     Returns:
-        out:        [B, T, HV, D] bf16
+        out:        [B, T, HV, D] fp32
         state_new:  [B, HV, D, D] fp32
         inter:      [B*T*HV, D, D] fp32 or None
     """
@@ -70,7 +70,7 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
     decay_per_hv = decay_per_q_head.repeat_interleave(HV // H).view(1, HV, 1, 1)
 
     state_running = state.clone()
-    out = torch.zeros(B, T, HV, D, dtype=torch.bfloat16, device=q.device)
+    out = torch.zeros(B, T, HV, D, dtype=torch.float32, device=q.device)
     inter = torch.zeros(B * T * HV, D, D, dtype=torch.float32, device=q.device) if cache_intermediate_states else None
 
     for t in range(T):
@@ -78,7 +78,7 @@ def torch_la_mtp_ref(q, k, v, state, decay_scales, scale, T, cache_intermediate_
         k_hv = k_f[:, t].repeat_interleave(HV // H, dim=1)
         v_t = v_f[:, t]
         state_running = state_running * decay_per_hv + k_hv.unsqueeze(-1) * v_t.unsqueeze(-2)
-        out[:, t] = torch.einsum("bhk,bhkv->bhv", q_hv, state_running).bfloat16()
+        out[:, t] = torch.einsum("bhk,bhkv->bhv", q_hv, state_running)
         if cache_intermediate_states:
             for b in range(B):
                 inter[b * T * HV + t * HV : b * T * HV + (t + 1) * HV] = state_running[b]
@@ -99,11 +99,11 @@ def _skip_if_no_sm90_or_later():
 # Helpers
 # ---------------------------------------------------------------------------
 def make_inputs(B, T, H, HV, D, device="cuda", seed=42):
-    """Returns q[B,T,H,D] bf16, k[B,T,H,D] bf16, v[B,T,HV,D] bf16, state[B,HV,D,D] fp32."""
+    """Returns q[B,T,H,D] fp32, k[B,T,H,D] fp32, v[B,T,HV,D] fp32, state[B,HV,D,D] fp32."""
     torch.manual_seed(seed)
-    q = torch.randn(B, T, H, D, device=device, dtype=torch.bfloat16)
-    k = torch.randn(B, T, H, D, device=device, dtype=torch.bfloat16)
-    v = torch.randn(B, T, HV, D, device=device, dtype=torch.bfloat16)
+    q = torch.randn(B, T, H, D, device=device, dtype=torch.float32)
+    k = torch.randn(B, T, H, D, device=device, dtype=torch.float32)
+    v = torch.randn(B, T, HV, D, device=device, dtype=torch.float32)
     state = torch.randn(B, HV, D, D, device=device, dtype=torch.float32) * 0.01
     return q, k, v, state
 
@@ -131,7 +131,7 @@ def run_la_mtp(
 
     # pretranspose: [B, HV, V, K]
     s_cute = state_4d.permute(0, 1, 3, 2).contiguous().clone()
-    out = torch.zeros(B, T, HV, V, device=q.device, dtype=torch.bfloat16)
+    out = torch.zeros(B, T, HV, V, device=q.device, dtype=torch.float32)
     s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
 
     if cache_intermediate_states:
@@ -316,7 +316,7 @@ def test_skip_with_negative_offset():
     q, k, v, state = make_inputs(B, T, H, HV, D)
     s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
     sentinel = 123.0
-    out = torch.full((B, T, HV, D), sentinel, device=q.device, dtype=torch.bfloat16)
+    out = torch.full((B, T, HV, D), sentinel, device=q.device, dtype=torch.float32)
     s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
     s_offsets[2] = -1  # skip batch index 2
 
@@ -352,7 +352,7 @@ def test_skip_with_negative_offset_cache_intermediate():
 
     q, k, v, state = make_inputs(B, T, H, HV, D)
     s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
-    out = torch.zeros(B, T, HV, D, device=q.device, dtype=torch.bfloat16)
+    out = torch.zeros(B, T, HV, D, device=q.device, dtype=torch.float32)
     s_offsets = torch.arange(B, device=q.device, dtype=torch.int32)
     s_offsets[2] = -1
 
@@ -417,6 +417,38 @@ def test_zero_state():
     rmse = torch.sqrt(torch.mean((o_cute.float() - o_ref.float()) ** 2)).item()
     max_ref = torch.abs(o_ref.float()).max().item()
     assert rmse / (max_ref + 1e-8) < 0.01, "zero state: output mismatch"
+
+
+def test_rejects_non_fp32_inputs():
+    _skip_if_no_sm90_or_later()
+    B, T, H, HV, D = 2, 4, 16, 16, 128
+    scale = D**-0.5
+    decay_scales = 0.3 * torch.arange(H, device="cuda", dtype=torch.float32) / H
+
+    q, k, v, state = make_inputs(B, T, H, HV, D)
+    s_cute = state.permute(0, 1, 3, 2).contiguous().clone()
+    out = torch.zeros(B, T, HV, D, device="cuda", dtype=torch.float32)
+    inter = torch.empty(1, 1, 1, device="cuda", dtype=torch.float32)
+    s_offsets = torch.arange(B, device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.empty(1, device="cuda", dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="q/k/v must be torch.float32"):
+        linear_attention_decode_mtp(
+            q.to(torch.bfloat16),
+            k,
+            v,
+            s_cute,
+            inter,
+            out,
+            decay_scales=decay_scales,
+            s_offsets=s_offsets,
+            cu_seqlens=cu_seqlens,
+            softmax_scale=scale,
+            T=T,
+            cache_intermediate_states=False,
+            disable_state_update=False,
+            is_varlen=False,
+        )
 
 
 if __name__ == "__main__":

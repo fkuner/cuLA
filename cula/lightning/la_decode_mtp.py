@@ -135,10 +135,10 @@ def la_verify_kernel_mtp(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32
     intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] fp32 (or dummy)
     decay_scales: cute.Tensor,  # [H] fp32
-    q: cute.Tensor,  # [B, T, H, K] bf16
-    k: cute.Tensor,  # [B, T, H, K] bf16
-    v: cute.Tensor,  # [B, T, HV, V] bf16
-    o: cute.Tensor,  # [B, T, HV, V] bf16
+    q: cute.Tensor,  # [B, T, H, K] fp32
+    k: cute.Tensor,  # [B, T, H, K] fp32
+    v: cute.Tensor,  # [B, T, HV, V] fp32
+    o: cute.Tensor,  # [B, T, HV, V] fp32
     h0_indices: cute.Tensor,  # [B] int32
     cu_seqlens: cute.Tensor,  # [B+1] int32 (dummy when is_varlen=False)
     vec_size: cutlass.Constexpr[int],
@@ -186,8 +186,6 @@ def la_verify_kernel_mtp(
     # ------------------------------------------------------------------
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     # r_h always declared with 8 rows; ilp_rows constexpr picks which are used.
     r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
 
@@ -227,11 +225,10 @@ def la_verify_kernel_mtp(
                         (1, 1, 1, vec_size),
                         (i_n, i_t, i_h, lane_in_group),
                     )
-                    cute.autovec_copy(q_tile, r_q_bf16)
-                    cute.autovec_copy(k_tile, r_k_bf16)
+                    cute.autovec_copy(q_tile, r_q)
+                    cute.autovec_copy(k_tile, r_k)
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = cutlass.Float32(r_q_bf16[i]) * scale
-                        r_k[i] = cutlass.Float32(r_k_bf16[i])
+                        r_q[i] = r_q[i] * scale
 
                     # Per-row dot-product accumulators (lo, hi) — zeroed each t step.
                     r_dot_lo = cute.make_rmem_tensor(cute.make_layout((ilp_rows,), stride=(1,)), cutlass.Float32)
@@ -285,7 +282,7 @@ def la_verify_kernel_mtp(
                     # ---- writeback ----
                     if lane_in_group == 0:
                         for slot in cutlass.range_constexpr(ilp_rows):
-                            o[(i_n, i_t, i_hv, v_idx_0 + slot)] = cutlass.BFloat16(r_dot_lo[slot])
+                            o[(i_n, i_t, i_hv, v_idx_0 + slot)] = r_dot_lo[slot]
 
                 # Final state writeback
                 if cutlass.const_expr(not disable_state_update):
@@ -481,12 +478,12 @@ def get_compiled_la_mtp_handle(
 # Public Python entry point
 # ============================================================================
 def linear_attention_decode_mtp(
-    q: torch.Tensor,  # [B, T, H, K] bf16
-    k: torch.Tensor,  # [B, T, H, K] bf16
-    v: torch.Tensor,  # [B, T, HV, V] bf16
+    q: torch.Tensor,  # [B, T, H, K] fp32
+    k: torch.Tensor,  # [B, T, H, K] fp32
+    v: torch.Tensor,  # [B, T, HV, V] fp32
     s: torch.Tensor,  # [pool_size, HV, V, K] fp32
     intermediate_states: torch.Tensor,  # [pool_size*T*HV, V, K] fp32 (or dummy)
-    out: torch.Tensor,  # [B, T, HV, V] bf16
+    out: torch.Tensor,  # [B, T, HV, V] fp32
     decay_scales: torch.Tensor,  # [H] fp32
     s_offsets: torch.Tensor,  # [B] int32 (-1 to skip)
     cu_seqlens: torch.Tensor,  # [B+1] int32 (reserved; see note below)
@@ -520,6 +517,18 @@ def linear_attention_decode_mtp(
     assert T_q == T, f"q.shape[1]={T_q} doesn't match T={T}"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
+    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+        raise ValueError(f"q/k/v must be torch.float32, got {q.dtype}/{k.dtype}/{v.dtype}")
+    if s.dtype != torch.float32:
+        raise ValueError(f"s must be torch.float32, got {s.dtype}")
+    if intermediate_states.dtype != torch.float32:
+        raise ValueError(f"intermediate_states must be torch.float32, got {intermediate_states.dtype}")
+    if out.dtype != torch.float32:
+        raise ValueError(f"out must be torch.float32, got {out.dtype}")
+    if decay_scales.dtype != torch.float32:
+        raise ValueError(f"decay_scales must be torch.float32, got {decay_scales.dtype}")
+    if s_offsets.dtype != torch.int32 or cu_seqlens.dtype != torch.int32:
+        raise ValueError(f"s_offsets/cu_seqlens must be torch.int32, got {s_offsets.dtype}/{cu_seqlens.dtype}")
 
     cache, (tile_v, vec_size, ilp_rows, use_packed_fma) = _la_mtp_compile_cache(
         B,

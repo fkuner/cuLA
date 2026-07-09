@@ -61,9 +61,9 @@ from cula.utils import USE_FAST_MATH
 # Bandwidth model — see spec §9.3
 # ─────────────────────────────────────────────────────────────────────────────
 def la_mtp_bytes(B, T, H, HV, K, V, cache_intermediate_states, disable_state_update):
-    bf16, fp32 = 2, 4
-    qkv = B * T * H * K * bf16 * 2 + B * T * HV * V * bf16  # q, k, v reads
-    out_w = B * T * HV * V * bf16  # o writes
+    fp32 = 4
+    qkv = B * T * H * K * fp32 * 2 + B * T * HV * V * fp32  # q, k, v reads
+    out_w = B * T * HV * V * fp32  # o writes
     h0_r = B * HV * V * K * fp32  # h0 reads
     h0_w = 0 if disable_state_update else B * HV * V * K * fp32  # h0 writes
     inter = B * T * HV * V * K * fp32 if cache_intermediate_states else 0
@@ -82,7 +82,7 @@ def run_config(
     B, T, H, HV, K, V, layer_idx, num_layers, peak_bps, cache_intermediate_states=False, disable_state_update=False
 ):
     device = "cuda"
-    dtype = torch.bfloat16
+    dtype = torch.float32
     scale = K**-0.5
     pool_size = B
 
@@ -328,7 +328,7 @@ def main():
 
     print("Lightning Attention MTP Decode Benchmark")
     print(f"  H={H}, HV={HV}, K={K}, V={V}, layer={args.layer_idx}/{args.num_layers}")
-    print(f"  dtype=bf16, state=fp32, peak={args.peak_bps:.2e} B/s")
+    print(f"  dtype=fp32, state=fp32, peak={args.peak_bps:.2e} B/s")
     print(f"  cache_intermediate_states={args.cache_intermediate}, disable_state_update={args.disable_state_update}")
     print(f"  USE_FAST_MATH={USE_FAST_MATH}, fla available={HAS_FLA}")
 

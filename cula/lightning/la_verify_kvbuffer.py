@@ -48,10 +48,14 @@ import functools
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.runtime import (
+    make_fake_compact_tensor,
+    make_fake_stream,
+)
+from cutlass.cute.typing import Int32
 import torch
 from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm as _llvm
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -147,18 +151,17 @@ BT: int = 8  # pad M and N dimensions to 8 for mma fragment
 def la_verify_kvbuffer_kernel(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32 (READ ONLY)
     decay_scales: cute.Tensor,  # [H] fp32
-    q: cute.Tensor,  # [B, T, H,  K] bf16
-    k: cute.Tensor,  # [B, T, H,  K] bf16
-    v: cute.Tensor,  # [B, T, HV, V] bf16
-    o: cute.Tensor,  # [B, T, HV, V] bf16 (WRITTEN)
+    q: cute.Tensor,  # [B, T, H,  K] fp32
+    k: cute.Tensor,  # [B, T, H,  K] fp32
+    v: cute.Tensor,  # [B, T, HV, V] fp32
+    o: cute.Tensor,  # [B, T, HV, V] fp32 (WRITTEN)
     h0_indices: cute.Tensor,  # [B] int32
-    k_buf: cute.Tensor,  # [pool_size, T, H, K] bf16 (WRITTEN when write_kv)
-    v_buf: cute.Tensor,  # [pool_size, T, HV, V] bf16 (WRITTEN when write_kv)
+    k_buf: cute.Tensor,  # [pool_size, T, H, K] fp32 (WRITTEN when write_kv)
+    v_buf: cute.Tensor,  # [pool_size, T, HV, V] fp32 (WRITTEN when write_kv)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
     scale: cutlass.Constexpr[float],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -192,8 +195,8 @@ def la_verify_kvbuffer_kernel(
 
     # ---- Per-lane registers ----
     r_decay_pow = cute.make_rmem_tensor(cute.make_layout((T + 1,), stride=(1,)), cutlass.Float32)
-    r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_q_f32 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_k_f32 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
     # ---- SMEM (all fp32; MMA bitcasts fp32->TF32, no separate conversion) ----
     # KP = K+4 pads the row stride so 132%32=4: the gid*4+tig access pattern then
@@ -232,17 +235,18 @@ def la_verify_kvbuffer_kernel(
             if t_tok < T:
                 q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t_tok, i_h, lane_id))
                 k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t_tok, i_h, lane_id))
-                cute.autovec_copy(q_tile, r_q_bf16)
-                cute.autovec_copy(k_tile, r_k_bf16)
+                cute.autovec_copy(q_tile, r_q_f32)
+                cute.autovec_copy(k_tile, r_k_f32)
                 for c in cutlass.range_constexpr(vec_size):
                     col = lane_id * vec_size + c
-                    sQ[(t_tok, col)] = cutlass.Float32(r_q_bf16[c]) * scale
-                    sK[(t_tok, col)] = cutlass.Float32(r_k_bf16[c])
+                    sQ[(t_tok, col)] = cutlass.Float32(r_q_f32[c]) * scale
+                    sK[(t_tok, col)] = cutlass.Float32(r_k_f32[c])
                 # Persist k to the pool buffer while it is already in registers.
                 if cutlass.const_expr(write_kv):
                     if i_v == 0 and i_hv % (HV // H) == 0:
                         kb_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size), (cache_idx, t_tok, i_h, lane_id))
-                        cute.autovec_copy(r_k_bf16, kb_tile)
+                        for c in cutlass.range_constexpr(vec_size):
+                            kb_tile[c] = r_k_f32[c]
             if t_tok >= T and t_tok < BT:
                 for c in cutlass.range_constexpr(vec_size):
                     col = lane_id * vec_size + c
@@ -333,7 +337,7 @@ def la_verify_kvbuffer_kernel(
                         vv = v[i_n, t, i_hv, v_base + lane_id]
                         sVbuf[(warp_idx, t, lane_id)] = cutlass.Float32(vv)
                         if cutlass.const_expr(write_kv):
-                            v_buf[(cache_idx, t, i_hv, v_base + lane_id)] = vv
+                            v_buf[(cache_idx, t, i_hv, v_base + lane_id)] = cutlass.Float32(vv)
 
                 # (d) Combine: o[t, row] = alpha^{t+1}*HQ[row,t] + sum_i qk[t,i]*v[i,row].
                 # The (t, row) output grid has T*ilp_rows entries. Distribute them
@@ -362,7 +366,7 @@ def la_verify_kvbuffer_kernel(
                         for i in cutlass.range_constexpr(T):
                             if i <= my_t:
                                 acc = acc + s_qk_scaled[(my_t, i)] * sVbuf[(warp_idx, i, my_slot)]
-                        o[(i_n, my_t, i_hv, v_base + my_slot)] = cutlass.BFloat16(acc)
+                        o[(i_n, my_t, i_hv, v_base + my_slot)] = acc
 
 
 @cute.jit
@@ -376,8 +380,8 @@ def run_la_verify_kvbuffer_kernel(
     h0_indices: cute.Tensor,
     k_buf: cute.Tensor,
     v_buf: cute.Tensor,
+    grid_size: Int32,
     scale: cutlass.Constexpr[float],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -390,7 +394,6 @@ def run_la_verify_kvbuffer_kernel(
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
-    grid_size = B * HV * num_v_tiles
 
     # Mirror the kernel's SMEM allocations (all fp32 = 4 bytes). BT=8, 4 warps.
     KP: cutlass.Constexpr[int] = K + 4
@@ -418,7 +421,6 @@ def run_la_verify_kvbuffer_kernel(
         num_v_tiles,
         tile_v,
         scale,
-        B,
         T,
         H,
         HV,
@@ -436,7 +438,6 @@ def run_la_verify_kvbuffer_kernel(
 
 @functools.cache
 def _get_compiled_verify_kvbuffer_kernel(
-    B: int,
     T: int,
     H: int,
     HV: int,
@@ -471,7 +472,6 @@ def _verify_kvbuffer_compile_cache(
         assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
         use_packed_fma = get_device_sm_version(device)[0] >= 10
         cache = _get_compiled_verify_kvbuffer_kernel_shuffle(
-            B,
             T,
             H,
             HV,
@@ -491,7 +491,6 @@ def _verify_kvbuffer_compile_cache(
     assert T <= 8, f"T={T} > 8: MMA kernel's BT=8 token staging only covers T ≤ 8"
     assert V % ilp_rows == 0, f"V={V} % ilp_rows={ilp_rows} ≠ 0: partial row-blocks would be silently skipped"
     cache = _get_compiled_verify_kvbuffer_kernel(
-        B,
         T,
         H,
         HV,
@@ -523,8 +522,10 @@ def get_compiled_verify_kvbuffer_handle(
     """Return a pre-compiled verify kernel handle (benchmark kernel-only path).
 
     Call ``linear_attention_verify_kvbuffer`` once with the same config first.
+    The returned handle has one stable signature for both MMA and shuffle paths:
+    ``(..., k_buf, v_buf, stream)``. It computes the runtime grid size internally.
     """
-    cache, _ = _verify_kvbuffer_compile_cache(
+    cache, (tile_v, _, _, _) = _verify_kvbuffer_compile_cache(
         B,
         T,
         H,
@@ -539,15 +540,45 @@ def get_compiled_verify_kvbuffer_handle(
     compiled = cache.get("compiled")
     if compiled is None:
         raise RuntimeError("Verify kernel not compiled for this config; call linear_attention_verify_kvbuffer once first.")
-    return compiled
+
+    num_v_tiles = (V + tile_v - 1) // tile_v
+
+    def run_compiled(
+        h0_source,
+        decay_scales,
+        q,
+        k,
+        v,
+        o,
+        h0_indices,
+        k_buf,
+        v_buf,
+        stream,
+    ):
+        grid_size = q.shape[0] * HV * num_v_tiles
+        compiled(
+            h0_source,
+            decay_scales,
+            q,
+            k,
+            v,
+            o,
+            h0_indices,
+            k_buf,
+            v_buf,
+            Int32(grid_size),
+            stream,
+        )
+
+    return run_compiled
 
 
 def linear_attention_verify_kvbuffer(
-    q: torch.Tensor,  # [B, T, H,  K] bf16
-    k: torch.Tensor,  # [B, T, H,  K] bf16
-    v: torch.Tensor,  # [B, T, HV, V] bf16
+    q: torch.Tensor,  # [B, T, H,  K] fp32
+    k: torch.Tensor,  # [B, T, H,  K] fp32
+    v: torch.Tensor,  # [B, T, HV, V] fp32
     s: torch.Tensor,  # [pool_size, HV, V, K] fp32, READ ONLY
-    out: torch.Tensor,  # [B, T, HV, V] bf16, WRITTEN
+    out: torch.Tensor,  # [B, T, HV, V] fp32, WRITTEN
     decay_scales: torch.Tensor,  # [H] fp32
     h0_indices: torch.Tensor,  # [B] int32, -1 to skip
     softmax_scale: float,
@@ -558,8 +589,10 @@ def linear_attention_verify_kvbuffer(
     """
     Closed-form parallel verify (KVBuffer Eq. 7). Writes out; does not touch s.
 
-    When k_buf and v_buf are provided, also writes k,v to pool-indexed buffers
-    so the caller can free the original k,v tensors after this call returns.
+    When k_buf and v_buf are provided, also writes k,v to fp32 pool-indexed
+    buffers so the caller can free the original k,v tensors after this call
+    returns. This matches Ling/SGLang, where q/k/v arrive after fp32 RoPE and
+    are committed into a fp32 temporal state.
 
     Dispatches between two equivalent implementations by draft depth T: the
     tensor-core MMA kernel below for T >= MMA_MIN_T, and the warp-shuffle kernel
@@ -586,10 +619,18 @@ def linear_attention_verify_kvbuffer(
     assert K == 128, f"K={K} != 128: kernel hardcodes K=128 (threads_per_group, KP=K+4, lane K-coverage)"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
+    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+        raise ValueError(f"q/k/v must be torch.float32, got {q.dtype}/{k.dtype}/{v.dtype}")
+    if s.dtype != torch.float32:
+        raise ValueError(f"s must be torch.float32, got {s.dtype}")
+    if out.dtype != torch.float32:
+        raise ValueError(f"out must be torch.float32, got {out.dtype}")
 
     write_kv = k_buf is not None and v_buf is not None
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
+    if write_kv and (k_buf.dtype != torch.float32 or v_buf.dtype != torch.float32):
+        raise ValueError(f"k_buf/v_buf must be torch.float32, got {k_buf.dtype}/{v_buf.dtype}")
 
     cache, (tile_v, vec_size, ilp_rows, _) = _verify_kvbuffer_compile_cache(
         B,
@@ -607,27 +648,58 @@ def linear_attention_verify_kvbuffer(
     h0_view = s.view(pool_size * HV, V, K)
 
     if not write_kv:
-        k_buf_t = torch.empty(1, 1, 1, 1, device=q.device, dtype=torch.bfloat16)
-        v_buf_t = torch.empty(1, 1, 1, 1, device=q.device, dtype=torch.bfloat16)
+        k_buf_t = torch.empty(1, T, H, K, device=q.device, dtype=torch.float32)
+        v_buf_t = torch.empty(1, T, HV, V, device=q.device, dtype=torch.float32)
     else:
         k_buf_t = k_buf
         v_buf_t = v_buf
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        # Use sym_int() for B so one compiled kernel handles all batch sizes
+        # (no per-B cute.compile JIT). Pattern from prefill (lightning_attn_sm100).
+        sym_b = cute.sym_int()
+        q_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        k_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        v_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        o_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        h0_fake = make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), V, K), stride_order=(2, 1, 0), assumed_align=16
+        )
+        decay_fake = make_fake_compact_tensor(
+            cutlass.Float32, (H,), stride_order=(0,), assumed_align=16
+        )
+        idx_fake = make_fake_compact_tensor(
+            cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16
+        )
+        k_buf_fake = make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        v_buf_fake = make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        stream_fake = make_fake_stream()
+
         compiled = cute.compile(
             run_la_verify_kvbuffer_kernel,
-            from_dlpack(h0_view, assumed_align=16),
-            from_dlpack(decay_scales, assumed_align=16),
-            from_dlpack(q, assumed_align=16),
-            from_dlpack(k, assumed_align=16),
-            from_dlpack(v, assumed_align=16),
-            from_dlpack(out, assumed_align=16),
-            from_dlpack(h0_indices, assumed_align=16),
-            from_dlpack(k_buf_t, assumed_align=16),
-            from_dlpack(v_buf_t, assumed_align=16),
+            h0_fake,
+            decay_fake,
+            q_fake,
+            k_fake,
+            v_fake,
+            o_fake,
+            idx_fake,
+            k_buf_fake,
+            v_buf_fake,
+            Int32(1),  # grid_size (positional, before Constexpr kwargs)
             scale=softmax_scale,
-            B=B,
             T=T,
             H=H,
             HV=HV,
@@ -637,12 +709,14 @@ def linear_attention_verify_kvbuffer(
             vec_size=vec_size,
             ilp_rows=ilp_rows,
             write_kv=write_kv,
-            stream=stream,
+            stream=stream_fake,
             options="--enable-tvm-ffi",
         )
         cache["compiled"] = compiled
 
     compiled = cache["compiled"]
+    num_v_tiles_rt = (V + tile_v - 1) // tile_v
+    grid_size = B * HV * num_v_tiles_rt
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
         h0_view,
@@ -654,6 +728,7 @@ def linear_attention_verify_kvbuffer(
         h0_indices,
         k_buf_t,
         v_buf_t,
+        Int32(grid_size),
         stream,
     )
 
@@ -670,18 +745,17 @@ def linear_attention_verify_kvbuffer(
 def la_verify_kvbuffer_shuffle_kernel(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32 (READ ONLY)
     decay_scales: cute.Tensor,  # [H] fp32
-    q: cute.Tensor,  # [B, T, H,  K] bf16
-    k: cute.Tensor,  # [B, T, H,  K] bf16
-    v: cute.Tensor,  # [B, T, HV, V] bf16
-    o: cute.Tensor,  # [B, T, HV, V] bf16 (WRITTEN)
+    q: cute.Tensor,  # [B, T, H,  K] fp32
+    k: cute.Tensor,  # [B, T, H,  K] fp32
+    v: cute.Tensor,  # [B, T, HV, V] fp32
+    o: cute.Tensor,  # [B, T, HV, V] fp32 (WRITTEN)
     h0_indices: cute.Tensor,  # [B] int32
-    k_buf: cute.Tensor,  # [pool_size, T, H, K] bf16 (WRITTEN when write_kv)
-    v_buf: cute.Tensor,  # [pool_size, T, HV, V] bf16 (WRITTEN when write_kv)
+    k_buf: cute.Tensor,  # [pool_size, T, H, K] fp32 (WRITTEN when write_kv)
+    v_buf: cute.Tensor,  # [pool_size, T, HV, V] fp32 (WRITTEN when write_kv)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
     scale: cutlass.Constexpr[float],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -713,8 +787,8 @@ def la_verify_kvbuffer_shuffle_kernel(
 
     cache_idx = h0_indices[i_n]
 
-    r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_q_f32 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_k_f32 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_h = cute.make_rmem_tensor(cute.make_layout((8, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_decay_pow = cute.make_rmem_tensor(cute.make_layout((T + 1,), stride=(1,)), cutlass.Float32)
     o_partial = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), cutlass.Float32)
@@ -759,17 +833,17 @@ def la_verify_kvbuffer_shuffle_kernel(
             for t in cutlass.range_constexpr(T):
                 q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t, i_h, lane_id))
                 k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t, i_h, lane_id))
-                cute.autovec_copy(q_tile, r_q_bf16)
-                cute.autovec_copy(k_tile, r_k_bf16)
+                cute.autovec_copy(q_tile, r_q_f32)
+                cute.autovec_copy(k_tile, r_k_f32)
                 for j in cutlass.range_constexpr(vec_size):
-                    s_q[(t, j, lane_id)] = cutlass.Float32(r_q_bf16[j]) * scale
-                    s_k[(t, j, lane_id)] = cutlass.Float32(r_k_bf16[j])
+                    s_q[(t, j, lane_id)] = cutlass.Float32(r_q_f32[j]) * scale
+                    s_k[(t, j, lane_id)] = cutlass.Float32(r_k_f32[j])
 
                 # Write k to buffer — gated: only one block per (b, h, t) writes
                 if cutlass.const_expr(write_kv):
                     if i_v == 0 and i_hv % (HV // H) == 0:
                         kb_tile = cute.local_tile(k_buf, (1, 1, 1, vec_size), (cache_idx, t, i_h, lane_id))
-                        cute.autovec_copy(r_k_bf16, kb_tile)
+                        cute.autovec_copy(r_k_f32, kb_tile)
 
         # Cooperative v load: first tile_v threads each stage one v-row for all T
         # steps into SMEM. v_buf write (when enabled) is fused here — every
@@ -852,7 +926,7 @@ def la_verify_kvbuffer_shuffle_kernel(
                     # writeback (all lanes hold the reduced value; lane 0 writes)
                     if lane_in_group == 0:
                         for slot in cutlass.range_constexpr(ilp_rows):
-                            o[(i_n, t, i_hv, v_base + slot)] = cutlass.BFloat16(o_partial[slot])
+                            o[(i_n, t, i_hv, v_base + slot)] = o_partial[slot]
 
 
 @cute.jit
@@ -866,8 +940,8 @@ def run_la_verify_kvbuffer_shuffle_kernel(
     h0_indices: cute.Tensor,
     k_buf: cute.Tensor,
     v_buf: cute.Tensor,
+    grid_size: Int32,
     scale: cutlass.Constexpr[float],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -881,7 +955,6 @@ def run_la_verify_kvbuffer_shuffle_kernel(
     stream: cuda.CUstream,
 ):
     num_v_tiles: cutlass.Constexpr[int] = (V + tile_v - 1) // tile_v
-    grid_size = B * HV * num_v_tiles
 
     # s_qk_scaled[T][T] + sVdata[T][tile_v] + s_q/s_k[T][vec_size][32]
     threads_per_group = 32
@@ -906,7 +979,6 @@ def run_la_verify_kvbuffer_shuffle_kernel(
         num_v_tiles,
         tile_v,
         scale,
-        B,
         T,
         H,
         HV,
@@ -925,7 +997,6 @@ def run_la_verify_kvbuffer_shuffle_kernel(
 
 @functools.cache
 def _get_compiled_verify_kvbuffer_kernel_shuffle(
-    B: int,
     T: int,
     H: int,
     HV: int,
@@ -943,23 +1014,24 @@ def _get_compiled_verify_kvbuffer_kernel_shuffle(
 
 
 def linear_attention_verify_kvbuffer_shuffle(
-    q: torch.Tensor,  # [B, T, H,  K] bf16
-    k: torch.Tensor,  # [B, T, H,  K] bf16
-    v: torch.Tensor,  # [B, T, HV, V] bf16
+    q: torch.Tensor,  # [B, T, H,  K] fp32
+    k: torch.Tensor,  # [B, T, H,  K] fp32
+    v: torch.Tensor,  # [B, T, HV, V] fp32
     s: torch.Tensor,  # [pool_size, HV, V, K] fp32, READ ONLY
-    out: torch.Tensor,  # [B, T, HV, V] bf16, WRITTEN
+    out: torch.Tensor,  # [B, T, HV, V] fp32, WRITTEN
     decay_scales: torch.Tensor,  # [H] fp32
     h0_indices: torch.Tensor,  # [B] int32, -1 to skip
     softmax_scale: float,
     T: int,
-    k_buf: torch.Tensor | None = None,  # [pool_size, T, H, K] bf16, WRITTEN
-    v_buf: torch.Tensor | None = None,  # [pool_size, T, HV, V] bf16, WRITTEN
+    k_buf: torch.Tensor | None = None,  # [pool_size, T, H, K] fp32, WRITTEN
+    v_buf: torch.Tensor | None = None,  # [pool_size, T, HV, V] fp32, WRITTEN
 ) -> None:
     """
     Closed-form parallel verify (KVBuffer Eq. 7). Writes out; does not touch s.
 
-    When k_buf and v_buf are provided, also writes k,v to pool-indexed buffers
-    so the caller can free the original k,v tensors after this call returns.
+    When k_buf and v_buf are provided, also writes k,v to fp32 pool-indexed
+    buffers so the caller can free the original k,v tensors after this call
+    returns.
 
     For batch b with h0_indices[b] < 0, out[b] is LEFT UNCHANGED — callers must
     pre-initialize out if downstream code reads those slots.
@@ -969,10 +1041,18 @@ def linear_attention_verify_kvbuffer_shuffle(
     assert K == 128, f"K={K} != 128: kernel hardcodes K=128 (threads_per_group, lane K-coverage)"
     _, _, HV, V = v.shape
     pool_size = s.shape[0]
+    if q.dtype != torch.float32 or k.dtype != torch.float32 or v.dtype != torch.float32:
+        raise ValueError(f"q/k/v must be torch.float32, got {q.dtype}/{k.dtype}/{v.dtype}")
+    if s.dtype != torch.float32:
+        raise ValueError(f"s must be torch.float32, got {s.dtype}")
+    if out.dtype != torch.float32:
+        raise ValueError(f"out must be torch.float32, got {out.dtype}")
 
     write_kv = k_buf is not None and v_buf is not None
     if (k_buf is None) != (v_buf is None):
         raise ValueError("k_buf and v_buf must both be None or both be provided")
+    if write_kv and (k_buf.dtype != torch.float32 or v_buf.dtype != torch.float32):
+        raise ValueError(f"k_buf/v_buf must be torch.float32, got {k_buf.dtype}/{v_buf.dtype}")
 
     cache, (tile_v, vec_size, ilp_rows, use_packed_fma) = _verify_kvbuffer_compile_cache(
         B,
@@ -989,29 +1069,57 @@ def linear_attention_verify_kvbuffer_shuffle(
 
     h0_view = s.view(pool_size * HV, V, K)
 
-    # Dummy tensors when write_kv=False (never accessed by kernel)
+    # Dummy fp32 tensors when write_kv=False (never accessed by kernel)
     if not write_kv:
-        k_buf_t = torch.empty(1, 1, 1, 1, device=q.device, dtype=torch.bfloat16)
-        v_buf_t = torch.empty(1, 1, 1, 1, device=q.device, dtype=torch.bfloat16)
+        k_buf_t = torch.empty(1, T, H, K, device=q.device, dtype=torch.float32)
+        v_buf_t = torch.empty(1, T, HV, V, device=q.device, dtype=torch.float32)
     else:
         k_buf_t = k_buf
         v_buf_t = v_buf
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        sym_b = cute.sym_int()
+        q_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        k_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        v_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        o_fake = make_fake_compact_tensor(
+            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        h0_fake = make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), V, K), stride_order=(2, 1, 0), assumed_align=16
+        )
+        decay_fake = make_fake_compact_tensor(
+            cutlass.Float32, (H,), stride_order=(0,), assumed_align=16
+        )
+        idx_fake = make_fake_compact_tensor(
+            cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16
+        )
+        k_buf_fake = make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        v_buf_fake = make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
+        )
+        stream_fake = make_fake_stream()
         compiled = cute.compile(
             run_la_verify_kvbuffer_shuffle_kernel,
-            from_dlpack(h0_view, assumed_align=16),
-            from_dlpack(decay_scales, assumed_align=16),
-            from_dlpack(q, assumed_align=16),
-            from_dlpack(k, assumed_align=16),
-            from_dlpack(v, assumed_align=16),
-            from_dlpack(out, assumed_align=16),
-            from_dlpack(h0_indices, assumed_align=16),
-            from_dlpack(k_buf_t, assumed_align=16),
-            from_dlpack(v_buf_t, assumed_align=16),
+            h0_fake,
+            decay_fake,
+            q_fake,
+            k_fake,
+            v_fake,
+            o_fake,
+            idx_fake,
+            k_buf_fake,
+            v_buf_fake,
+            Int32(1),
             scale=softmax_scale,
-            B=B,
             T=T,
             H=H,
             HV=HV,
@@ -1022,12 +1130,14 @@ def linear_attention_verify_kvbuffer_shuffle(
             ilp_rows=ilp_rows,
             use_packed_fma=use_packed_fma,
             write_kv=write_kv,
-            stream=stream,
+            stream=stream_fake,
             options="--enable-tvm-ffi",
         )
         cache["compiled"] = compiled
 
     compiled = cache["compiled"]
+    num_v_tiles_rt = (V + tile_v - 1) // tile_v
+    grid_size = B * HV * num_v_tiles_rt
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     compiled(
         h0_view,
@@ -1039,5 +1149,6 @@ def linear_attention_verify_kvbuffer_shuffle(
         h0_indices,
         k_buf_t,
         v_buf_t,
+        Int32(grid_size),
         stream,
     )

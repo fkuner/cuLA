@@ -418,7 +418,9 @@ def la_state_update_kernel_fused(
             v_idx_0 = i_v * tile_v + group_idx * rows_per_group + chunk * ilp_rows
             if v_idx_0 + (ilp_rows - 1) < V:
                 for slot in cutlass.range_constexpr(ilp_rows):
-                    h_tile = cute.local_tile(h0_source, (1, 1, 1, vec_size), (i_layer, flat_state_idx, v_idx_0 + slot, lane_in_group))
+                    h_tile = cute.local_tile(
+                        h0_source, (1, 1, 1, vec_size), (i_layer, flat_state_idx, v_idx_0 + slot, lane_in_group)
+                    )
                     cute.autovec_copy(h_tile, cute.slice_(r_h, (slot, None)))
 
                 for i in cutlass.range(0, L, unroll=0):
@@ -432,7 +434,9 @@ def la_state_update_kernel_fused(
                             )
 
                 for slot in cutlass.range_constexpr(ilp_rows):
-                    h_out = cute.local_tile(h0_source, (1, 1, 1, vec_size), (i_layer, flat_state_idx, v_idx_0 + slot, lane_in_group))
+                    h_out = cute.local_tile(
+                        h0_source, (1, 1, 1, vec_size), (i_layer, flat_state_idx, v_idx_0 + slot, lane_in_group)
+                    )
                     cute.autovec_copy(cute.slice_(r_h, (slot, None)), h_out)
 
 
@@ -543,8 +547,17 @@ def linear_attention_state_update_kvbuffer_fused(
     use_packed_fma = get_device_sm_version(k_buf.device)[0] >= 10
 
     cache = _get_compiled_state_update_kernel_fused(
-        num_layers, T, H, HV, K, V, pool_size_l,
-        tile_v, vec_size, ilp_rows, use_packed_fma,
+        num_layers,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size_l,
+        tile_v,
+        vec_size,
+        ilp_rows,
+        use_packed_fma,
     )
 
     h0_view = s.view(num_layers, pool_size_l * HV, V, K)
@@ -553,26 +566,40 @@ def linear_attention_state_update_kvbuffer_fused(
         sym_b = cute.sym_int()
         pool_hv = pool_size_l * HV
         h0_fake = make_fake_compact_tensor(
-            cutlass.Float32, (num_layers, pool_hv, V, K),
-            stride_order=(3, 2, 1, 0), assumed_align=16,
+            cutlass.Float32,
+            (num_layers, pool_hv, V, K),
+            stride_order=(3, 2, 1, 0),
+            assumed_align=16,
         )
         decay_fake = make_fake_compact_tensor(
-            cutlass.Float32, (num_layers, H),
-            stride_order=(1, 0), assumed_align=16,
+            cutlass.Float32,
+            (num_layers, H),
+            stride_order=(1, 0),
+            assumed_align=16,
         )
         k_buf_fake = make_fake_compact_tensor(
-            cutlass.Float32, (num_layers, pool_size_l, T, H, K),
-            stride_order=(4, 3, 2, 1, 0), assumed_align=16,
+            cutlass.Float32,
+            (num_layers, pool_size_l, T, H, K),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=16,
         )
         v_buf_fake = make_fake_compact_tensor(
-            cutlass.Float32, (num_layers, pool_size_l, T, HV, V),
-            stride_order=(4, 3, 2, 1, 0), assumed_align=16,
+            cutlass.Float32,
+            (num_layers, pool_size_l, T, HV, V),
+            stride_order=(4, 3, 2, 1, 0),
+            assumed_align=16,
         )
         idx_fake = make_fake_compact_tensor(
-            cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16,
+            cutlass.Int32,
+            (sym_b,),
+            stride_order=(0,),
+            assumed_align=16,
         )
         acc_fake = make_fake_compact_tensor(
-            cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16,
+            cutlass.Int32,
+            (sym_b,),
+            stride_order=(0,),
+            assumed_align=16,
         )
         stream_fake = make_fake_stream()
 

@@ -48,14 +48,14 @@ import functools
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import torch
+from cutlass._mlir.dialects import arith as _arith
+from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.runtime import (
     make_fake_compact_tensor,
     make_fake_stream,
 )
 from cutlass.cute.typing import Int32
-import torch
-from cutlass._mlir.dialects import arith as _arith
-from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cutlass_dsl import T as _T
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -658,27 +658,13 @@ def linear_attention_verify_kvbuffer(
         # Use sym_int() for B so one compiled kernel handles all batch sizes
         # (no per-B cute.compile JIT). Pattern from prefill (lightning_attn_sm100).
         sym_b = cute.sym_int()
-        q_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        k_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        v_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        o_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        h0_fake = make_fake_compact_tensor(
-            cutlass.Float32, (cute.sym_int(), V, K), stride_order=(2, 1, 0), assumed_align=16
-        )
-        decay_fake = make_fake_compact_tensor(
-            cutlass.Float32, (H,), stride_order=(0,), assumed_align=16
-        )
-        idx_fake = make_fake_compact_tensor(
-            cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16
-        )
+        q_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16)
+        k_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16)
+        v_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16)
+        o_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16)
+        h0_fake = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(), V, K), stride_order=(2, 1, 0), assumed_align=16)
+        decay_fake = make_fake_compact_tensor(cutlass.Float32, (H,), stride_order=(0,), assumed_align=16)
+        idx_fake = make_fake_compact_tensor(cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16)
         k_buf_fake = make_fake_compact_tensor(
             cutlass.Float32, (cute.sym_int(), T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
         )
@@ -1079,27 +1065,13 @@ def linear_attention_verify_kvbuffer_shuffle(
 
     if "compiled" not in cache:
         sym_b = cute.sym_int()
-        q_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        k_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        v_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        o_fake = make_fake_compact_tensor(
-            cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16
-        )
-        h0_fake = make_fake_compact_tensor(
-            cutlass.Float32, (cute.sym_int(), V, K), stride_order=(2, 1, 0), assumed_align=16
-        )
-        decay_fake = make_fake_compact_tensor(
-            cutlass.Float32, (H,), stride_order=(0,), assumed_align=16
-        )
-        idx_fake = make_fake_compact_tensor(
-            cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16
-        )
+        q_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16)
+        k_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16)
+        v_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16)
+        o_fake = make_fake_compact_tensor(cutlass.Float32, (sym_b, T, HV, V), stride_order=(3, 2, 1, 0), assumed_align=16)
+        h0_fake = make_fake_compact_tensor(cutlass.Float32, (cute.sym_int(), V, K), stride_order=(2, 1, 0), assumed_align=16)
+        decay_fake = make_fake_compact_tensor(cutlass.Float32, (H,), stride_order=(0,), assumed_align=16)
+        idx_fake = make_fake_compact_tensor(cutlass.Int32, (sym_b,), stride_order=(0,), assumed_align=16)
         k_buf_fake = make_fake_compact_tensor(
             cutlass.Float32, (cute.sym_int(), T, H, K), stride_order=(3, 2, 1, 0), assumed_align=16
         )

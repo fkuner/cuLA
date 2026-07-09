@@ -285,9 +285,7 @@ def run_config(B, T, H, K, V, layer_idx, num_layers):
     compiled_verify = get_compiled_verify_kvbuffer_handle(
         B, T, H, HV, K, V, pool_size, scale, write_kv=True, device=q_4d.device
     )
-    compiled_update = get_compiled_state_update_kvbuffer_handle(
-        B, T, H, HV, K, V, pool_size, device=q_4d.device
-    )
+    compiled_update = get_compiled_state_update_kvbuffer_handle(B, T, H, HV, K, V, pool_size, device=q_4d.device)
 
     def kernel_kvbuf_verify():
         compiled_verify(
